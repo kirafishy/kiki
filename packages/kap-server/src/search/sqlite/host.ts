@@ -74,7 +74,7 @@ export class SqliteSearchHost {
   private readonly pending = new Map<string, SqliteSessionInput>();
   private readonly targeted = new Map<string, { revision: number; session?: SqliteSessionInput; sent: boolean }>();
   private inventoryRevision = 0;
-  private targetedRevision = 0;
+  private revision = 0;
   private inventoryToSend = false;
   private inventoryInFlight = false;
   private readonly known = new Map<string, SqliteSessionInput>();
@@ -139,7 +139,8 @@ export class SqliteSearchHost {
   }
 
   private setInventory(sessions: readonly SqliteSessionInput[]): void {
-    this.inventoryRevision++;
+    this.inventoryRevision = ++this.revision;
+    this.targeted.clear();
     this.known.clear();
     this.pending.clear();
     for (const session of sessions) {
@@ -163,7 +164,7 @@ export class SqliteSearchHost {
     if (this.stopped) return;
     this.known.set(session.id, session);
     this.pending.set(session.id, session);
-    this.targeted.set(session.id, { revision: ++this.targetedRevision, session, sent: false });
+    this.targeted.set(session.id, { revision: ++this.revision, session, sent: false });
     this.startIndexer();
     this.flushTargeted();
     this.options.onStateChange?.(this.snapshot());
@@ -173,7 +174,7 @@ export class SqliteSearchHost {
     if (this.stopped) return;
     this.known.delete(sessionId);
     this.pending.delete(sessionId);
-    this.targeted.set(sessionId, { revision: ++this.targetedRevision, sent: false });
+    this.targeted.set(sessionId, { revision: ++this.revision, sent: false });
     this.startIndexer();
     this.flushTargeted();
     this.options.onStateChange?.(this.snapshot());
@@ -213,7 +214,6 @@ export class SqliteSearchHost {
     if (this.stopped || !this.child || !this.ready) throw new GlobalSearchError('index_unavailable', 'search indexer is unavailable');
     if (this.readonlyWriter) throw new GlobalSearchError('readonly_index', 'another process owns the search index');
     if (this.reindexRequest) throw new GlobalSearchError('index_unavailable', 'search reindex is already running');
-    this.targeted.clear();
     const child = this.child;
     const id = ++this.id;
     this.rebuilding = true;
@@ -379,9 +379,9 @@ export class SqliteSearchHost {
         if (targeted?.revision !== message.revision) return;
         this.targeted.delete(message.sessionId);
         this.pending.delete(message.sessionId);
-        if (targeted.session === undefined && message.missing) this.known.delete(message.sessionId);
+        if (message.missing) this.known.delete(message.sessionId);
       } else if (message.type === 'synced') {
-        if (message.revision !== this.inventoryRevision) return;
+        if (message.revision !== this.inventoryRevision || this.targeted.has(message.sessionId)) return;
         if (this.reason === 'disk_low' || this.reason === 'indexer_backoff' ||
           this.reason === 'memory_budget') this.reason = undefined;
         this.pending.delete(message.sessionId);

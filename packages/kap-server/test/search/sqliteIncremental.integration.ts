@@ -160,3 +160,73 @@ it('halts on a blocked WAL checkpoint and automatically resumes after the reader
       recoveryMs: performance.now() - releasedAt, documents: count() }));
   } finally { if (reader.isTransaction) reader.exec('ROLLBACK'); reader.close(); }
 });
+
+it('leaves WAL-paused work with its caller when automatic recovery is disabled', async () => {
+  index.close();
+  const path = join(home, 'index.sqlite');
+  index = await SqliteSearchIndex.open(path, { walPauseBytes: 64 * 1024, walRetryMs: 20 });
+  const file = await wire('s1', 'first');
+  await index.syncSession(session('s1'), false);
+  const reader = new DatabaseSync(path, { readOnly: true });
+  reader.exec('BEGIN');
+  reader.prepare('SELECT count(*) AS n FROM docs').get();
+  try {
+    await appendFile(file, Array.from({ length: 300 }, (_, i) => line(`entry-${i} ${'xyz'.repeat(50)}`)).join(''));
+    await expect(index.syncSession(session('s1'), false)).resolves.toBe(false);
+    expect(index.syncStatus.state).toBe('wal_stuck');
+    expect(index['pendingSessions'].size).toBe(0);
+    const pausedOffset = offset(file);
+    reader.exec('COMMIT');
+    await expect.poll(() => index.syncStatus.state).toBe('ready');
+    await index['syncQueue'];
+    expect(offset(file)).toBe(pausedOffset);
+    await expect(index.retireSession('s1')).resolves.toBe(true);
+    expect(index.db.prepare('SELECT 1 FROM sessions WHERE id=?').get('s1')).toBeUndefined();
+  } finally { if (reader.isTransaction) reader.exec('ROLLBACK'); reader.close(); }
+});
+
+it('skips non-branch subagent directories without inserting skip rows when indexSubagents is false while indexing side branches', async () => {
+  await wire('s1', 'main needle');
+  await mkdir(join(home, 's1', 'agents', 'sub-1'), { recursive: true });
+  await writeFile(join(home, 's1', 'agents', 'sub-1', 'wire.jsonl'), line('subagent hidden one'));
+  await mkdir(join(home, 's1', 'agents', 'sub-2'), { recursive: true });
+  await writeFile(join(home, 's1', 'agents', 'sub-2', 'wire.jsonl'), line('subagent hidden two'));
+  await mkdir(join(home, 's1', 'agents', 'branch-1'), { recursive: true });
+  await writeFile(join(home, 's1', 'agents', 'branch-1', 'wire.jsonl'), line('branch visible needle'));
+  await writeFile(
+    join(home, 's1', 'state.json'),
+    JSON.stringify({
+      title: 'branch session',
+      agents: {
+        'sub-1': { labels: {} },
+        'branch-1': { labels: { branch: 'true' } },
+      },
+    }),
+  );
+  index.resetReadCounters();
+  await index.syncSession(session('s1'));
+  expect(index.syncStatus.wireFilesRead).toBe(2);
+  const rows = index.db
+    .prepare('SELECT agent_id, policy FROM files WHERE session_id=? ORDER BY agent_id')
+    .all('s1') as { agent_id: string; policy: string }[];
+  expect(rows).toEqual([
+    { agent_id: 'branch-1', policy: 'full' },
+    { agent_id: 'main', policy: 'full' },
+  ]);
+  expect((await index.search({
+    query: 'branch visible',
+    literalQuery: normalizeLiteral('branch visible'),
+    mode: 'literal',
+    sort: 'time_desc',
+    op: 'AND',
+    pageSize: 10,
+  })).rows).toHaveLength(1);
+  expect((await index.search({
+    query: 'subagent hidden',
+    literalQuery: normalizeLiteral('subagent hidden'),
+    mode: 'literal',
+    sort: 'time_desc',
+    op: 'AND',
+    pageSize: 10,
+  })).rows).toHaveLength(0);
+});

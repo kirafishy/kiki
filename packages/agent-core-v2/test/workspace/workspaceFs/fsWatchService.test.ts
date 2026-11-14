@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DisposableStore } from '#/_base/di/lifecycle';
 import { createServices } from '#/_base/di/test';
 import { IHostFileSystem } from '#/os/interface/hostFileSystem';
+import { HostFsError, OsFsErrors } from '#/os/interface/hostFsErrors';
 import {
   type HostFsChange,
   type IHostFsWatchHandle,
@@ -48,12 +49,14 @@ function stubWorkspaceDirs(): IWorkspaceDirs {
 interface FakeWatch {
   readonly service: IHostFsWatchService;
   readonly watchCalls: string[];
+  readonly lastOptions: () => Parameters<IHostFsWatchService['watch']>[1];
   fire: (rel: string, action: HostFsChange['action'], kind?: HostFsChange['kind']) => void;
   readonly disposedCount: () => number;
 }
 
 function fakeHostFsWatch(): FakeWatch {
   const watchCalls: string[] = [];
+  let latestOptions: Parameters<IHostFsWatchService['watch']>[1];
   let listener: ((e: HostFsChange) => void) | undefined;
   let disposedCount = 0;
   const handle: IHostFsWatchHandle = {
@@ -69,28 +72,28 @@ function fakeHostFsWatch(): FakeWatch {
   };
   const service: IHostFsWatchService = {
     _serviceBrand: undefined,
-    watch: (path) => {
+    watch: (path, options) => {
       watchCalls.push(path);
+      latestOptions = options;
       return handle;
     },
   };
   return {
     service,
     watchCalls,
+    lastOptions: () => latestOptions,
     fire: (rel, action, kind = 'file') =>
       listener?.({ path: join(WORK_DIR, rel), action, kind }),
     disposedCount: () => disposedCount,
   };
 }
 
-function fakeHostFs(gitignore?: string): IHostFileSystem {
+function fakeHostFs(gitignore?: string | (() => Promise<string>)): IHostFileSystem {
   return {
     _serviceBrand: undefined,
     readText: async (p: string) => {
-      if (gitignore !== undefined && p === join(WORK_DIR, '.gitignore')) return gitignore;
-      const err = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
-      err.code = 'ENOENT';
-      throw err;
+      if (gitignore !== undefined && p === join(WORK_DIR, '.gitignore')) return typeof gitignore === 'string' ? gitignore : gitignore();
+      throw new HostFsError(OsFsErrors.codes.OS_FS_NOT_FOUND, p);
     },
   } as unknown as IHostFileSystem;
 }
@@ -100,7 +103,7 @@ interface Harness {
   readonly watch: FakeWatch;
 }
 
-function makeWorkspace(gitignore?: string): Harness {
+function makeWorkspace(gitignore?: string | (() => Promise<string>)): Harness {
   const watch = fakeHostFsWatch();
   const disposables = new DisposableStore();
   const services = createServices(disposables, {
@@ -134,18 +137,20 @@ describe('WorkspaceFsWatchService', () => {
     vi.useRealTimers();
   });
 
-  it('starts the os watcher on the workspace root for a non-empty subscription', () => {
+  it('starts the os watcher on the workspace root for a non-empty subscription', async () => {
     const { svc, watch } = makeWorkspace();
     const sub = svc.subscribe();
     sub.setWatchedPaths(['src']);
+    await vi.advanceTimersByTimeAsync(0);
     expect(watch.watchCalls).toEqual([WORK_DIR]);
     expect(sub.watchedPaths).toEqual(['src']);
   });
 
-  it('drops events outside the subscribed subtree', () => {
+  it('drops events outside the subscribed subtree', async () => {
     const { svc, watch } = makeWorkspace();
     const sub = svc.subscribe();
     sub.setWatchedPaths(['src']);
+    await vi.advanceTimersByTimeAsync(0);
     const events = collect(sub);
 
     watch.fire('src/a.ts', 'created');
@@ -156,10 +161,11 @@ describe('WorkspaceFsWatchService', () => {
     expect(events[0]?.changes).toEqual([{ path: 'src/a.ts', change: 'created', kind: 'file' }]);
   });
 
-  it('coalesces changes within a window into one event', () => {
+  it('coalesces changes within a window into one event', async () => {
     const { svc, watch } = makeWorkspace();
     const sub = svc.subscribe();
     sub.setWatchedPaths(['.']);
+    await vi.advanceTimersByTimeAsync(0);
     const events = collect(sub);
 
     watch.fire('a.ts', 'created');
@@ -172,10 +178,11 @@ describe('WorkspaceFsWatchService', () => {
     expect(events[0]?.changes).toHaveLength(3);
   });
 
-  it('marks the event truncated when the window overflows', () => {
+  it('marks the event truncated when the window overflows', async () => {
     const { svc, watch } = makeWorkspace();
     const sub = svc.subscribe();
     sub.setWatchedPaths(['.']);
+    await vi.advanceTimersByTimeAsync(0);
     const events = collect(sub);
 
     for (let i = 0; i < 501; i++) watch.fire(`f${i}.ts`, 'created');
@@ -191,9 +198,8 @@ describe('WorkspaceFsWatchService', () => {
     const { svc, watch } = makeWorkspace('dist/\n');
     const sub = svc.subscribe();
     sub.setWatchedPaths(['.']);
+    await vi.advanceTimersByTimeAsync(0);
     const events = collect(sub);
-    await Promise.resolve();
-    await Promise.resolve();
 
     watch.fire('dist/x.js', 'created');
     watch.fire('src/keep.ts', 'created');
@@ -203,6 +209,36 @@ describe('WorkspaceFsWatchService', () => {
     expect(events[0]?.changes.map((c) => c.path)).toEqual(['src/keep.ts']);
   });
 
+  it('reads ignore rules before starting the crawl and rebuilds the watcher only when they change', async () => {
+    let resolveInitial!: (content: string) => void;
+    let rules = new Promise<string>((resolve) => { resolveInitial = resolve; });
+    const { svc, watch } = makeWorkspace(() => rules);
+    const sub = svc.subscribe();
+    const events = collect(sub);
+    sub.setWatchedPaths(['.']);
+    expect(watch.watchCalls).toHaveLength(0);
+    resolveInitial('dist/\n.gitignore\n');
+    await vi.advanceTimersByTimeAsync(0);
+    const directory = { isDirectory: () => true };
+    expect(watch.lastOptions()?.ignored?.(join(WORK_DIR, 'dist'), directory)).toBe(true);
+    expect(watch.lastOptions()?.ignored?.(join(WORK_DIR, '.gitignore'))).toBe(false);
+
+    watch.fire('.gitignore', 'modified');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(watch.watchCalls).toHaveLength(1);
+    rules = Promise.resolve('build/\n.gitignore\n');
+    watch.fire('.gitignore', 'modified');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(watch.watchCalls).toHaveLength(2);
+    expect(watch.disposedCount()).toBe(1);
+    expect(watch.lastOptions()?.ignored?.(join(WORK_DIR, 'dist'), directory)).toBe(false);
+    expect(watch.lastOptions()?.ignored?.(join(WORK_DIR, 'build'), directory)).toBe(true);
+    watch.fire('dist/visible.js', 'created');
+    watch.fire('build/hidden.js', 'created');
+    vi.advanceTimersByTime(200);
+    expect(events.flatMap((event) => event.changes.map((change) => change.path))).toEqual(['dist/visible.js']);
+  });
+
   it('rejects paths that escape the workspace', () => {
     const { svc } = makeWorkspace();
     const sub = svc.subscribe();
@@ -210,19 +246,21 @@ describe('WorkspaceFsWatchService', () => {
     expect(() => sub.setWatchedPaths(['/abs'])).toThrowError(/Use a non-empty workspace-relative path/);
   });
 
-  it('disposes the os handle when the last watched path set becomes empty', () => {
+  it('disposes the os handle when the last watched path set becomes empty', async () => {
     const { svc, watch } = makeWorkspace();
     const sub = svc.subscribe();
     sub.setWatchedPaths(['src']);
+    await vi.advanceTimersByTimeAsync(0);
     expect(watch.disposedCount()).toBe(0);
     sub.setWatchedPaths([]);
     expect(watch.disposedCount()).toBe(1);
   });
 
-  it('does not fire after the service is disposed', () => {
+  it('does not fire after the service is disposed', async () => {
     const { svc, watch } = makeWorkspace();
     const sub = svc.subscribe();
     sub.setWatchedPaths(['.']);
+    await vi.advanceTimersByTimeAsync(0);
     const events = collect(sub);
     watch.fire('a.ts', 'created');
     (svc as unknown as { dispose: () => void }).dispose();
@@ -230,13 +268,14 @@ describe('WorkspaceFsWatchService', () => {
     expect(events).toHaveLength(0);
   });
 
-  it('shares one os watch across subscriptions and fans events out per subscription', () => {
+  it('shares one os watch across subscriptions and fans events out per subscription', async () => {
     const { svc, watch } = makeWorkspace();
     const subA = svc.subscribe();
     const subB = svc.subscribe();
     subA.setWatchedPaths(['src']);
     subB.setWatchedPaths(['lib']);
     subB.setWatchedPaths(['lib', 'src']);
+    await vi.advanceTimersByTimeAsync(0);
     const eventsA = collect(subA);
     const eventsB = collect(subB);
 
@@ -259,6 +298,7 @@ describe('WorkspaceFsWatchService', () => {
     const subB = svc.subscribe();
     subA.setWatchedPaths(['src']);
     subB.setWatchedPaths(['lib']);
+    await vi.advanceTimersByTimeAsync(0);
     expect(watch.watchCalls).toEqual([WORK_DIR]);
 
     subA.setWatchedPaths([]);
@@ -268,12 +308,13 @@ describe('WorkspaceFsWatchService', () => {
     expect(watch.disposedCount()).toBe(1);
   });
 
-  it('gives each subscription its own truncation counters', () => {
+  it('gives each subscription its own truncation counters', async () => {
     const { svc, watch } = makeWorkspace();
     const subA = svc.subscribe();
     const subB = svc.subscribe();
     subA.setWatchedPaths(['.']);
     subB.setWatchedPaths(['.']);
+    await vi.advanceTimersByTimeAsync(0);
     const eventsA = collect(subA);
     const eventsB = collect(subB);
 
@@ -284,5 +325,23 @@ describe('WorkspaceFsWatchService', () => {
     expect(eventsB).toHaveLength(1);
     expect(eventsA[0]?.truncated).toBe(true);
     expect(eventsB[0]?.truncated).toBe(true);
+  });
+
+  it('passes a gitignore-backed ignored filter to hostFsWatch to prune .git and node_modules traversal', async () => {
+    const { svc, watch } = makeWorkspace('node_modules\nbuild/\n');
+    const sub = svc.subscribe();
+    sub.setWatchedPaths(['.']);
+    await vi.advanceTimersByTimeAsync(0);
+    const ignored = watch.lastOptions()?.ignored;
+    expect(ignored).toBeTypeOf('function');
+    expect(ignored!(WORK_DIR)).toBe(false);
+    expect(ignored!(join(WORK_DIR, '.git'))).toBe(true);
+    expect(ignored!(join(WORK_DIR, '.git', 'HEAD'))).toBe(true);
+    expect(ignored!(join(WORK_DIR, 'node_modules'))).toBe(true);
+    expect(ignored!(join(WORK_DIR, 'node_modules', 'pkg', 'index.js'))).toBe(true);
+    expect(ignored!(join(WORK_DIR, 'src', 'index.ts'))).toBe(false);
+    expect(ignored!(join(WORK_DIR, 'build'))).toBe(false);
+    expect(ignored!(join(WORK_DIR, 'build'), { isDirectory: () => true })).toBe(true);
+    expect(ignored!(join(WORK_DIR, 'build'), { isDirectory: () => false })).toBe(false);
   });
 });

@@ -1626,4 +1626,29 @@ describe('SessionMetadata', () => {
     expect(mirror.recorded).toHaveLength(1);
     expect(mirror.recorded[0]?.archived).toBe(true);
   });
+
+  it('skips redundant mirror writes on subagent-only updates and normalizes usage key order', async () => {
+    const meta = ix.get(ISessionMetadata);
+    await meta.ready;
+    expect(mirror.recorded).toHaveLength(1);
+
+    await meta.registerAgent('sub-1', { createdAt: 10, type: 'sub' });
+    await meta.updateAgent('sub-1', (current) => ({ ...current, status: 'completed', toolCallCount: 3 }));
+    expect(mirror.recorded).toHaveLength(1);
+
+    meta.recordUsage('model-a', {
+      output: 9,
+      inputCacheCreation: 2,
+      inputCacheRead: 3,
+      inputOther: 5,
+    });
+    await meta.drain();
+    expect(mirror.recorded).toHaveLength(2);
+    expect(Object.keys(mirror.recorded[1]!.usage!.total)).toEqual([
+      'inputOther',
+      'output',
+      'inputCacheRead',
+      'inputCacheCreation',
+    ]);
+  });
 });

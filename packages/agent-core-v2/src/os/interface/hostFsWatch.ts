@@ -17,7 +17,7 @@ export interface HostFsChange {
  * ignored too, which lets the watcher drop whole directory trees without
  * resolving each event.
  */
-export type HostFsWatchIgnore = ((path: string) => boolean) & {
+export type HostFsWatchIgnore = ((path: string, stats?: { isDirectory(): boolean }) => boolean) & {
   readonly subtree?: (path: string) => boolean;
 };
 

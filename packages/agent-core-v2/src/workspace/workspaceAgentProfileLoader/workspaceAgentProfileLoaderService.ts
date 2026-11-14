@@ -135,6 +135,7 @@ export class WorkspaceAgentProfileLoaderService
     );
     const handle = this.fsWatch.watch(projectRoot, {
       ignored: subtreeWatchFilter(projectRoot, candidates),
+      signal: true,
     });
     this._register(handle);
     this._register(

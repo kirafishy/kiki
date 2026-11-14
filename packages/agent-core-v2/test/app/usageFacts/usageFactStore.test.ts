@@ -79,6 +79,57 @@ describe('UsageFactStore', () => {
     await expect(facts.summary(SCOPE)).resolves.toEqual({});
   });
 
+  it.each(['fingerprint', 'epoch'] as const)('rechecks a blocked public privacy flight after a %s change before publishing usage', async (change) => {
+    const documents = ix.get(IAtomicDocumentStore);
+    const sessionScope = 'sessions/example/session';
+    await documents.set(sessionScope, 'state.json', { id: 'session', private: false, agents: {} });
+    let release!: () => void, enter!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    const get = documents.get.bind(documents);
+    vi.spyOn(documents, 'get').mockImplementationOnce(async <T>(scope: string, key: string) => {
+      const value = await get<T>(scope, key);
+      enter();
+      await blocked;
+      return value;
+    });
+    const first = facts.commit(SCOPE, 0, checkpoint(1), [normalizeUsageFact(fact(), 'main')!]);
+    await entered;
+    const other = `${sessionScope}/agents/other`;
+    try {
+      if (change === 'fingerprint') await documents.set(sessionScope, 'state.json', { id: 'session', private: true, agents: {} });
+      else await facts.setSessionPrivacy({ ...session, private: true });
+      const second = facts.commit(other, 0, checkpoint(1), [normalizeUsageFact(fact(), 'other')!]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      release();
+      await Promise.all([first, second]);
+      for (const source of [SCOPE, other]) {
+        const directory = `cache/usage-facts-v1/${createHash('sha256').update(source).digest('hex')}`;
+        expect(await storage.size(directory, 'facts.jsonl')).toBeUndefined();
+        expect((await model.summary(source)).totals).toBeUndefined();
+      }
+    } finally { release(); await first; }
+  });
+
+  it.each([false, true])('accepts usage for a recreated public session after an intervening private read: %s', async (readPrivate) => {
+    const documents = ix.get(IAtomicDocumentStore);
+    const sessionScope = 'sessions/example/session';
+    await documents.set(sessionScope, 'state.json', { ...session, private: false, agents: {} });
+    await facts.setSessionPrivacy({ ...session, private: true });
+    await facts.commit(SCOPE, 0, checkpoint(1), [normalizeUsageFact(fact(), 'main')!]);
+    expect(await storage.size(DIRECTORY, 'facts.jsonl')).toBeUndefined();
+    await documents.set(sessionScope, 'state.json', { ...session, private: true, agents: {} });
+    if (readPrivate) await expect(facts.summary(SCOPE)).resolves.toEqual({});
+    await storage.delete(sessionScope, 'state.json');
+    const replacement = { ...session, createdAt: 2, private: false };
+    await documents.set(sessionScope, 'state.json', { ...replacement, agents: {} });
+    await model.catalog([{ ...replacement, deleted: false }], [{ source: SCOPE, workspaceId: session.workspaceId, sessionId: session.id }]);
+    await facts.commit(SCOPE, 0, checkpoint(1), [normalizeUsageFact(fact(), 'main')!]);
+    expect(await facts.journalSize(SCOPE)).toBeGreaterThan(0);
+    expect((await facts.read(SCOPE)).records).toHaveLength(1);
+    expect((await model.query(query)).total).toMatchObject({ usage: fact().usage, knownRecords: 1 });
+  });
+
   it('hides SQL totals through privacy cataloging and restores them when privacy is cleared', async () => {
     logs.append(SCOPE, KEY, fact());
     await logs.flush();
@@ -360,5 +411,25 @@ describe('UsageFactStore', () => {
     const reading = facts.read(SCOPE, undefined, controller.signal);
     await entered; controller.abort(); await expect(reading).rejects.toMatchObject({ name: 'AbortError' }); release();
     expect((await facts.read(SCOPE)).records).toHaveLength(1);
+  });
+
+  it('caches session privacy across agent scopes until state.json changes on disk', async () => {
+    const documents = ix.get(IAtomicDocumentStore);
+    await documents.set('sessions/example/session', 'state.json', { id: 'session', private: false, agents: {} });
+    const getSpy = vi.spyOn(documents, 'get');
+    const agentScopes = Array.from({ length: 48 }, (_, index) => `sessions/example/session/agents/agent-${index}`);
+    for (const agentScope of agentScopes.slice(0, 4)) {
+      logs.append(agentScope, KEY, fact(1));
+    }
+    await logs.flush();
+
+    await Promise.all(agentScopes.map((agentScope) => facts.journalSize(agentScope)));
+    await Promise.all(agentScopes.slice(0, 8).map((agentScope) => facts.summary(agentScope)));
+    expect(getSpy).toHaveBeenCalledTimes(1);
+
+    await documents.set('sessions/example/session', 'state.json', { id: 'session', private: true, agents: {} });
+    const summaries = await Promise.all(agentScopes.slice(0, 8).map((agentScope) => facts.summary(agentScope)));
+    expect(summaries.every((entry) => entry.totals === undefined)).toBe(true);
+    expect(getSpy).toHaveBeenCalledTimes(2);
   });
 });

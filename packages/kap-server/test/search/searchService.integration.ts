@@ -1198,7 +1198,7 @@ describe('GlobalSearchService', () => {
       status: () => ({ source: 'authoritative', state: 'ready', degradedCount: 0 }),
       listRecent: async () => ({ items: [...records.values()], nextCursor: undefined }),
       get: async (id: string) => deferGets
-        ? await new Promise<SessionSummary | undefined>((resolve) => { pendingGets.push(resolve); })
+        ? new Promise<SessionSummary | undefined>((resolve) => { pendingGets.push(resolve); })
         : records.get(id),
       archiveFamily: async () => [],
       count: async () => records.size,
@@ -1269,6 +1269,87 @@ describe('GlobalSearchService', () => {
           score: h.score,
         }));
       expect(project(live)).toEqual(project(index));
+    });
+
+    it('retains a dirty on-disk session until publication and indexes its first public summary immediately', { timeout: 30_000 }, async () => {
+      const s1 = summary('s1', 'existing', T1);
+      const created = summary('s2', 'new', T2);
+      const indexed = [s1];
+      const index = gettableIndex(indexed);
+      const changes = new Emitter<SessionIndexMutation>();
+      const mirror = { onDidChange: changes.event } as ISessionIndexMirror;
+      await writeWire(home!, s1.id, 'main', [userLine('existing wire', T1)]);
+      const service = track(makeService(home!, index, mirror));
+      await service.reindex();
+      const watcher = service['sourceWatcher']!;
+      watcher.close();
+      await writeWire(home!, created.id, 'main', [userLine('newly visible wire', T2)]);
+      const dirty = service['dirtySessions'];
+      dirty.set(created.id, { workspaceId: WS });
+      await service['ensureSyncStarted']();
+      expect(dirty.has(created.id)).toBe(true);
+      expect(service['sqliteHost'].snapshot().indexedSessions).toBe(1);
+
+      service.syncDebounceMs = 60_000;
+      let enter!: () => void, release!: () => void;
+      const entered = new Promise<void>((resolve) => { enter = resolve; });
+      const blocked = new Promise<void>((resolve) => { release = resolve; });
+      const listRecent = index.listRecent.bind(index);
+      index.listRecent = async (query) => {
+        const page = await listRecent(query);
+        const items = [...page.items];
+        enter();
+        await blocked;
+        return { ...page, items };
+      };
+      service['inventoryDirty'] = true;
+      const syncing = service['ensureSyncStarted']();
+      await entered;
+      try {
+        indexed.push(created);
+        index.get = async (id) => indexed.find((row) => row.id === id);
+        changes.fire({ id: created.id, workspaceId: WS });
+        await expect.poll(() => service['allSummaries'].has(created.id)).toBe(true);
+        await expect.poll(() => service['sqliteHost'].snapshot().indexedSessions, { timeout: 10_000 }).toBe(2);
+      } finally { release(); await syncing; }
+      await expect.poll(() => service['sqliteHost'].snapshot().state, { timeout: 10_000 }).toBe('ready');
+      expect(service['allSummaries'].has(created.id)).toBe(true);
+      expect((await service.search({ query: 'newly visible wire', mode: 'literal', indexOnly: true })).items).toHaveLength(1);
+      changes.dispose();
+    });
+
+    it('uses targeted syncSession on incremental main updates and ignores subagent or checkpoint watch noise', { timeout: 30_000 }, async () => {
+      const s1 = summary('s1', 'first', T1);
+      const s2 = summary('s2', 'second', T1);
+      await writeTitle(home!, 's1', 'first');
+      await writeTitle(home!, 's2', 'second');
+      const main1 = await writeWire(home!, 's1', 'main', [userLine('initial one', T1)]);
+      await writeWire(home!, 's2', 'main', [userLine('initial two', T1)]);
+      const service = track(makeService(home!, gettableIndex([s1, s2])));
+      await service.reindex();
+      await expect.poll(async () => (await service.status()).indexer?.pendingSessions, { timeout: 10_000 }).toBe(0);
+
+      const host = service['sqliteHost'];
+      let fullSyncCalls = 0;
+      const targetedIds: string[] = [];
+      const origSync = host.sync.bind(host);
+      const origSyncSession = host.syncSession.bind(host);
+      host.sync = (sessions) => { fullSyncCalls += 1; origSync(sessions); };
+      host.syncSession = (input) => { targetedIds.push(input.id); origSyncSession(input); };
+
+      await writeWire(home!, 's1', 'sub-noise', [userLine('subagent ignored', T2)]);
+      const cpDir = join(home!, 'sessions', WS, 's1', 'replay-checkpoints');
+      await mkdir(cpDir, { recursive: true });
+      await writeFile(join(cpDir, 'engine-v1'), '{"seq":1}', 'utf8');
+      await writeFile(join(home!, 'sessions', WS, 's1', 'state.json.tmp.99'), '{}', 'utf8');
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect(fullSyncCalls).toBe(0);
+      expect(targetedIds).toEqual([]);
+
+      await appendFile(main1, `${userLine('targeted incremental hit', T3)}\n`, 'utf8');
+      await expect.poll(async () => (await service.search({ query: 'targeted incremental hit', mode: 'literal', indexOnly: true })).items.length, { timeout: 10_000 }).toBe(1);
+      expect(fullSyncCalls).toBe(0);
+      expect(targetedIds).toEqual(['s1']);
     });
   });
 });

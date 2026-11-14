@@ -125,21 +125,24 @@ async function sessionMetaInfo(dir: string): Promise<{ title: string; branchAgen
   return { title: '', branchAgents: new Set() };
 }
 
-async function wireFiles(dir: string): Promise<{ path: string; agentId: string }[]> {
+async function wireFiles(dir: string, indexSubagents: boolean, branchAgents: ReadonlySet<string>): Promise<{ path: string; agentId: string }[]> {
   const files: { path: string; agentId: string }[] = [];
   try { if ((await stat(join(dir, 'wire.jsonl'))).isFile()) files.push({ path: join(dir, 'wire.jsonl'), agentId: 'main' }); } catch {}
-  async function visit(path: string): Promise<void> {
-    let entries;
-    try { entries = await readdir(path, { withFileTypes: true }); } catch { return; }
-    for (const entry of entries) {
-      const child = join(path, entry.name);
-      if (entry.isDirectory()) await visit(child);
-      else if (entry.isFile() && entry.name === 'wire.jsonl') {
-        files.push({ path: child, agentId: child.slice(join(dir, 'agents').length + 1).split(/[\\/]/)[0]! });
-      }
+  if (!indexSubagents) {
+    const agentIds = ['main', ...[...branchAgents].filter((agentId) => agentId !== 'main').toSorted()];
+    for (const agentId of agentIds) {
+      const candidate = join(dir, 'agents', agentId, 'wire.jsonl');
+      try { if ((await stat(candidate)).isFile()) files.push({ path: candidate, agentId }); } catch {}
     }
+    return files;
   }
-  await visit(join(dir, 'agents'));
+  let entries;
+  try { entries = await readdir(join(dir, 'agents'), { withFileTypes: true }); } catch { return files; }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidate = join(dir, 'agents', entry.name, 'wire.jsonl');
+    try { if ((await stat(candidate)).isFile()) files.push({ path: candidate, agentId: entry.name }); } catch {}
+  }
   return files;
 }
 
@@ -369,8 +372,8 @@ export class SqliteSearchIndex {
     return false;
   }
 
-  syncSession(session: SqliteSessionInput): Promise<void> {
-    const task = this.syncQueue.catch(() => {}).then(() => this.syncSessionInner(session));
+  syncSession(session: SqliteSessionInput, retryOnWalRecovery = true): Promise<boolean> {
+    const task = this.syncQueue.catch(() => {}).then(() => this.syncSessionInner(session, retryOnWalRecovery));
     this.syncQueue = task;
     return task;
   }
@@ -382,12 +385,16 @@ export class SqliteSearchIndex {
     return task;
   }
 
-  private async syncSessionInner(session: SqliteSessionInput): Promise<void> {
+  private async syncSessionInner(session: SqliteSessionInput, retryOnWalRecovery: boolean): Promise<boolean> {
     if (this.closed) throw new Error('search index is closed');
-    if (this.options.isStopped?.()) return;
-    if (this.walStuck) { this.pendingSessions.set(session.id, session); return; }
+    const pause = (): false => {
+      if (retryOnWalRecovery) this.pendingSessions.set(session.id, session);
+      return false;
+    };
+    if (this.options.isStopped?.()) return false;
+    if (this.walStuck) return pause();
     const id = await identity(session.dir);
-    if (id === undefined) { await this.removeSession(session.id); return; }
+    if (id === undefined) return this.removeSession(session.id);
     const db = this.db;
     const { title, branchAgents } = await sessionMetaInfo(session.dir);
     const existing = db.prepare('SELECT title,identity,dir FROM sessions WHERE id=?').get(session.id) as
@@ -416,16 +423,37 @@ export class SqliteSearchIndex {
       }
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
-    const files = await wireFiles(session.dir);
+    const files = await wireFiles(session.dir, this.indexSubagents, branchAgents);
     for (const file of files) {
-      if (this.options.isStopped?.()) return;
-      if (this.walStuck) { this.pendingSessions.set(session.id, session); return; }
+      if (this.options.isStopped?.()) return false;
+      if (this.walStuck) return pause();
       await this.syncFile(session, file.path, file.agentId, branchAgents.has(file.agentId));
     }
-    if (this.walStuck) { this.pendingSessions.set(session.id, session); return; }
+    if (this.walStuck) return pause();
     const paths = new Set(files.map((file) => file.path));
-    const stored = db.prepare('SELECT id,path FROM files WHERE session_id=?').all(session.id) as { id: number; path: string }[];
-    for (const file of stored) if (!paths.has(file.path)) this.removeFile(file.id);
+    const stored = db.prepare('SELECT id,path,agent_id,policy FROM files WHERE session_id=?').all(session.id) as {
+      id: number; path: string; agent_id: string; policy: string;
+    }[];
+    for (const file of stored) {
+      if (paths.has(file.path)) continue;
+      if (!this.indexSubagents && file.agent_id !== 'main' && !branchAgents.has(file.agent_id)) {
+        if (file.policy === 'skip') continue;
+        if (file.policy === 'quarantined') {
+          if (db.prepare('SELECT 1 FROM docs WHERE file_id=? LIMIT 1').get(file.id)) {
+            db.exec('BEGIN');
+            try { this.deleteDocs('file_id', file.id); this.bumpGeneration(); db.exec('COMMIT'); }
+            catch (error) { db.exec('ROLLBACK'); throw error; }
+          }
+          continue;
+        }
+        if (await stat(file.path).then((info) => info.isFile(), () => false)) {
+          await this.syncFile(session, file.path, file.agent_id, false);
+          continue;
+        }
+      }
+      this.removeFile(file.id);
+    }
+    return true;
   }
 
   private removeFile(fileId: number): void {
@@ -600,7 +628,6 @@ export class SqliteSearchIndex {
         .run(String(skipped));
       await commit();
       db.exec('COMMIT');
-      if (this.walStuck) this.pendingSessions.set(session.id, session);
       db.exec('BEGIN');
       try {
         db.prepare("DELETE FROM meta WHERE k='inflight' AND v=?").run(path);

@@ -358,7 +358,7 @@ export class HostFsWatchService implements IHostFsWatchService {
     const ignored = options?.ignored;
     const watchOptions = watched === path || ignored === undefined ? options : {
       ...options,
-      ignored: Object.assign((changed: string) => ignored(requestedPath(changed)), {
+      ignored: Object.assign<HostFsWatchIgnore, { subtree?: (changed: string) => boolean }>((changed, stats) => ignored(requestedPath(changed), stats), {
         subtree: ignored.subtree === undefined ? undefined : (changed: string) => ignored.subtree!(requestedPath(changed)),
       }),
     };

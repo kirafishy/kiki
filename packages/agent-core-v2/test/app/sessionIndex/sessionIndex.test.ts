@@ -36,7 +36,7 @@ import {
 } from '#/app/sessionIndex/sessionIndexModel';
 import { FileSessionIndex } from '#/app/sessionIndex/sessionIndexService';
 import { SessionIndexProjector } from '#/app/sessionIndex/sessionIndexProjector';
-import { scanSessionsMaxMtime } from '#/app/sessionIndex/sessionIndexSource';
+import { buildSessionSummary, scanSessionsMaxMtime } from '#/app/sessionIndex/sessionIndexSource';
 import {
   drainSessionIndexMirror,
   SessionIndexMirror,
@@ -772,13 +772,14 @@ describe('FileSessionIndex (read model)', () => {
     flagEnabled: boolean | ((id: string) => boolean) = true,
     appendLog: IAppendLogStore = new AppendLogStore(fileStorage),
     documents: IAtomicDocumentStore = new JsonAtomicDocumentStore(fileStorage),
+    logService: ILogService = stubLog(),
   ): FileSessionIndex {
     const host = createScopedTestHost([
       stubPair(IFileSystemStorageService, fileStorage),
       stubPair(IAtomicDocumentStore, documents),
       stubPair(IAppendLogStore, appendLog),
       stubPair(IBootstrapService, stubBootstrap(homeDir)),
-      stubPair(ILogService, stubLog()),
+      stubPair(ILogService, logService),
       stubPair(IFlagService, stubFlag(flagEnabled)),
     ]);
     disposeHost = () => {
@@ -4571,5 +4572,54 @@ describe('FileSessionIndex (read model)', () => {
     await vi.waitFor(async () => {
       expect(await store.count({ includeArchived: false })).toBe(4);
     });
+  });
+
+  it('drains buffered mirror updates before watched reconciliation so mirrored edits report zero drift', async () => {
+    const logger = stubLog();
+    const infoSpy = vi.spyOn(logger, 'info');
+    await seedSession('s1', { title: 'initial', createdAt: 1, updatedAt: 10 });
+    const store = build(
+      new FileStorageService(homeDir),
+      true,
+      undefined,
+      undefined,
+      logger,
+    );
+    await store.prepare();
+    await store.reconcileNow({ reuseFingerprints: true });
+
+    await seedSession('s1', {
+      title: 'mirrored-next',
+      createdAt: 1,
+      updatedAt: 20,
+      usage: {
+        total: { output: 2, inputOther: 1, inputCacheRead: 0, inputCacheCreation: 0 },
+        byModel: {},
+      },
+    });
+    mirror.record(
+      buildSessionSummary({
+        id: 's1',
+        workspaceId,
+        title: 'mirrored-next',
+        createdAt: 1,
+        updatedAt: 20,
+        archived: false,
+        usage: {
+          total: { output: 2, inputOther: 1, inputCacheRead: 0, inputCacheCreation: 0 },
+          byModel: {},
+        },
+      }),
+    );
+    infoSpy.mockClear();
+    sourceChanges.fire({
+      path: join(sessionsDir, workspaceId, 's1', 'session-meta', 'state.json'),
+      action: 'modified',
+      kind: 'file',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1_150));
+    expect((await store.get('s1'))?.title).toBe('mirrored-next');
+    expect(infoSpy.mock.calls.some(([msg]) => msg === 'session index reconciliation repaired drift')).toBe(false);
+    infoSpy.mockRestore();
   });
 });

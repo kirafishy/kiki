@@ -2722,8 +2722,14 @@ describe('agent profile loaders + session catalog', () => {
         await stack.ready();
         const parent = stack.catalog.get('team')!;
         const previous = stack.catalog.snapshot();
-        const refreshed = waitForEvent(stack.catalog.onDidChange);
         await new Promise((resolve) => setTimeout(resolve, 300));
+        const refreshed = new Promise<void>((resolvePromise) => {
+          const d = stack.catalog.onDidChange((sourceId) => {
+            if (sourceId !== 'workspace') return;
+            d.dispose();
+            resolvePromise();
+          });
+        });
         await writeFile(childPath, privateAgentMd('writer', 'after'));
         await Promise.race([
           refreshed,
