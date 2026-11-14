@@ -187,6 +187,7 @@ describe('PluginPanelHost document source', () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     getPluginPanelDocument
       .mockResolvedValueOnce({ html: '<p>v1</p>', url: 'http://grant-a.kiki-document.localhost:1234/plugin-panel/a' })
+      .mockResolvedValueOnce({ html: '<p>v1</p>', url: 'http://grant-a2.kiki-document.localhost:1234/plugin-panel/a2' })
       .mockResolvedValueOnce({ html: '<p>v1</p>', url: 'http://grant-b.kiki-document.localhost:5678/plugin-panel/b' });
 
     const container = window.document.createElement('div');
@@ -208,7 +209,13 @@ describe('PluginPanelHost document source', () => {
     for (let attempt = 0; attempt < 12 && container.querySelector('iframe') === null; attempt += 1) {
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
     }
-    expect(container.querySelector('iframe')?.getAttribute('src')).toContain('/plugin-panel/a');
+    expect(container.querySelector('iframe')?.getAttribute('src')).toBe('http://grant-a.kiki-document.localhost:1234/plugin-panel/a');
+
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['plugin-panel-document'] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.querySelector('iframe')?.getAttribute('src')).toBe('http://grant-a.kiki-document.localhost:1234/plugin-panel/a');
 
     bag.meta = { server_id: 'server-b' };
     if (changeEndpoint) bag.client.baseUrl = 'https://new-server.example.test/root/';
@@ -217,7 +224,7 @@ describe('PluginPanelHost document source', () => {
       await queryClient.invalidateQueries({ queryKey: ['plugin-panel-document'] });
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
-    expect(getPluginPanelDocument).toHaveBeenCalledTimes(2);
+    expect(getPluginPanelDocument).toHaveBeenCalledTimes(3);
     expect(container.querySelector('iframe')?.getAttribute('src')).toBe('http://grant-b.kiki-document.localhost:5678/plugin-panel/b');
     queryClient.clear();
     delete bag.scopeId;

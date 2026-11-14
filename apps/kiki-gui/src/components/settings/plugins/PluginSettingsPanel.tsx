@@ -172,6 +172,13 @@ function PluginSettingsDocument({ pluginId, panelId, label }: PluginSettingsPane
     retry: false,
   });
   const panelDocument = documentQuery.data;
+  const lastObservedRef = useRef<{
+    readonly identity: string;
+    readonly doc: NonNullable<typeof panelDocument>;
+  } | null>(null);
+  if (panelDocument !== undefined && lastObservedRef.current?.doc !== panelDocument) {
+    lastObservedRef.current = { identity: documentIdentity, doc: panelDocument };
+  }
   const freshMintedAt = documentQuery.dataUpdatedAt || Date.now();
   const [renderedState, setRenderedState] = useState<{
     readonly identity: string;
@@ -188,14 +195,14 @@ function PluginSettingsDocument({ pluginId, panelId, label }: PluginSettingsPane
   );
   if (!dirty && panelDocument !== undefined) {
     const identityChanged = renderedState !== undefined && renderedState.identity !== documentIdentity;
+    const staleFromPreviousIdentity = lastObservedRef.current?.identity !== documentIdentity;
     if (
       renderedState === undefined ||
       identityChanged ||
       renderedState.doc.html !== panelDocument.html ||
       (renderedState.doc.url === undefined) !== (panelDocument.url === undefined) ||
-      (renderedState.needsFreshGrant && panelDocument !== renderedState.doc)
+      (renderedState.needsFreshGrant && !staleFromPreviousIdentity && panelDocument !== renderedState.doc)
     ) {
-      const staleFromPreviousIdentity = identityChanged && panelDocument === renderedState.doc;
       setRenderedState({
         identity: documentIdentity,
         doc: panelDocument,

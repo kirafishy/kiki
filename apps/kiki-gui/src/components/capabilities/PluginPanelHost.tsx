@@ -83,6 +83,10 @@ export function PluginPanelHost({
   const frameRef = useRef<HTMLIFrameElement>(null);
   const recent = useRef<number[]>([]);
   const pinnedRef = useRef<PinnedPanelDocument | null>(null);
+  const lastObservedRef = useRef<{
+    readonly identity: string;
+    readonly doc: { readonly html: string; readonly url?: string };
+  } | null>(null);
   const [loadSeq, setLoadSeq] = useState(0);
   const effectiveLabel = label ?? title ?? panelId;
   const effectiveTarget: PluginUsageTarget | undefined =
@@ -182,17 +186,20 @@ export function PluginPanelHost({
 
   const panelDocument = documentQuery.data;
   if (panelDocument !== undefined) {
+    if (lastObservedRef.current?.doc !== panelDocument) {
+      lastObservedRef.current = { identity: documentIdentity, doc: panelDocument };
+    }
     const freshMintedAt = documentQuery.dataUpdatedAt || Date.now();
     const currentPinned = pinnedRef.current;
     const identityChanged = currentPinned !== null && currentPinned.identity !== documentIdentity;
+    const staleFromPreviousIdentity = lastObservedRef.current.identity !== documentIdentity;
     if (
       currentPinned === null ||
       identityChanged ||
       currentPinned.html !== panelDocument.html ||
       (currentPinned.url === undefined) !== (panelDocument.url === undefined) ||
-      (currentPinned.needsFreshGrant && panelDocument !== currentPinned.sourceDoc)
+      (currentPinned.needsFreshGrant && !staleFromPreviousIdentity && panelDocument !== currentPinned.sourceDoc)
     ) {
-      const staleFromPreviousIdentity = identityChanged && panelDocument === currentPinned.sourceDoc;
       pinnedRef.current = {
         identity: documentIdentity,
         sourceDoc: panelDocument,
