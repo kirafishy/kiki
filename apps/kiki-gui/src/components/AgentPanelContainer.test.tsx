@@ -42,16 +42,18 @@ const harness = vi.hoisted(() => {
   const getAutoCompact = vi.fn();
   const getAgentCapabilities = vi.fn();
   const getAgentPlan = vi.fn();
+  const sessionUsageAccounting = vi.fn();
   const events = { on: vi.fn((_name: string, _listener: (source: { sessionId?: string; agentId?: string }) => void) => ({ ready: Promise.resolve(), dispose: vi.fn() })) };
   const klient = {
     global: { agentPanel: { read: (query: unknown, options: { signal: AbortSignal }) => getAgentCapabilities(query, options.signal) } },
     events,
+    rest: { sessionUsageAccounting },
     session: (_sessionId: string) => ({
       events,
       agent: (agentId: string) => ({ getPlan: () => getAgentPlan(agentId) }),
     }),
   };
-  const client = { getAutoCompact };
+  const client = { getAutoCompact, klient };
   const controller = {
     beginContentRead,
     loadTranscriptEntities,
@@ -89,6 +91,7 @@ const harness = vi.hoisted(() => {
     emit: () => { for (const listener of listeners) listener(); },
     getAgentCapabilities,
     getAgentPlan,
+    sessionUsageAccounting,
     getAutoCompact,
     client,
     klient,
@@ -145,6 +148,8 @@ beforeEach(() => {
   getAgentCapabilities.mockReset();
   getAgentPlan.mockReset();
   getAgentPlan.mockResolvedValue(null);
+  harness.sessionUsageAccounting.mockReset();
+  harness.sessionUsageAccounting.mockImplementation(() => new Promise(() => {}));
   harness.getAutoCompact.mockReset();
   harness.getAutoCompact.mockRejectedValue(new Error('Fixture has no compaction status'));
   harness.beginContentRead.mockClear();
@@ -681,6 +686,61 @@ const coldMetrics = {
   usageSource: 'persisted' as const,
 };
 
+it('retains a measured header captured before a streaming revision and a later cold header', async () => {
+  let resolveHeader!: (value: unknown) => void;
+  let headers = 0;
+  getAgentCapabilities.mockImplementation((query: { metrics_settle?: boolean }) => {
+    if (query.metrics_settle) return new Promise(() => {});
+    headers += 1;
+    return headers === 1 ? new Promise((resolve) => { resolveHeader = resolve; }) : Promise.resolve({ metrics: { main: coldMetrics } });
+  });
+  await render('main', { part: 'overview' });
+  harness.agents['main'] = viewState({ usage: { total: { inputOther: 10, output: 0, inputCacheRead: 0, inputCacheCreation: 0 } } });
+  await act(async () => { harness.emit(); });
+  await act(async () => { resolveHeader({ metrics: { main: countedMetrics(1_200, 0.05) } }); });
+  await flushRender();
+  expect(element.querySelector('[data-overview-fact="tokens"]')?.textContent).toContain('1.2k');
+  harness.agents['main'] = viewState({ profile: 'new-binding', usage: { total: { inputOther: 20, output: 0, inputCacheRead: 0, inputCacheCreation: 0 } } });
+  await act(async () => { harness.emit(); });
+  await flushRender();
+  expect(headers).toBeGreaterThan(1);
+  expect(element.querySelector('[data-overview-fact="tokens"]')?.textContent).toContain('1.2k');
+  expect(element.querySelector('[data-metrics-counting]')).not.toBeNull();
+});
+
+it.each(['state', 'forest'] as const)('shows %s usage tokens before a cold panel settle without double-counting cache input', async (source) => {
+  getAgentCapabilities.mockImplementation((query: { metrics_settle?: boolean }) => query.metrics_settle
+    ? new Promise(() => {}) : Promise.resolve({ metrics: { child: coldMetrics } }));
+  const usage = { total: { inputOther: 1_000, output: 200, inputCacheRead: 300, inputCacheCreation: 100 } };
+  const base = forestOf(['child']);
+  const forest = source === 'forest' ? { ...base, byId: { child: { ...base.byId['child']!, usage } } } : base;
+  if (source === 'state') harness.agents['child'] = viewState({ usage });
+  await render('child', { part: 'overview', forest });
+  expect(element.querySelector('[data-overview-fact="tokens"]')?.textContent).toContain('1.6k');
+  expect(element.querySelector('[data-metrics-counting]')).not.toBeNull();
+});
+
+it('derives a missing total from inclusive input and output metrics', async () => {
+  getAgentCapabilities.mockResolvedValue({ metrics: { main: { ...countedMetrics(1_600, 0), totalTokens: null,
+    inputTokens: 1_400, outputTokens: 200, cacheReadTokens: 300, cacheWriteTokens: 100 } } });
+  await render('main', { part: 'overview' });
+  expect(element.querySelector('[data-overview-fact="tokens"]')?.textContent).toContain('1.6k');
+});
+
+it('shows canonical session tokens as an incomplete tree subtotal while per-agent metrics settle', async () => {
+  getAgentCapabilities.mockImplementation((query: { metrics_settle?: boolean }) => query.metrics_settle
+    ? new Promise(() => {}) : Promise.resolve({ metrics: { main: coldMetrics } }));
+  harness.sessionUsageAccounting.mockResolvedValue({ version: 2, subject: { session_id: 'session', scope: 'session' }, covered_at: 1,
+    complete: false, freshness: 'stale', tokens: { input_other: 1_000, output: 200, input_cache_read: 300, input_cache_creation: 100 },
+    tokens_unknown: false, cost_usd_estimated: 0, cost_unknown: true });
+  await render('main', { part: 'overview', forest: forestOf(['main', 'child']) });
+  await act(async () => { element.querySelector<HTMLButtonElement>('[data-usage-scope="tree"]')?.click(); });
+  await flushRender();
+  expect(harness.sessionUsageAccounting).toHaveBeenCalledWith('session', expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  expect(element.querySelector('[data-overview-fact="tokens"]')?.textContent).toContain('1.6k');
+  expect(element.querySelector('[data-metrics-counting]')).not.toBeNull();
+});
+
 it('paints the overview before a cold settle and then shows the completed tokens', async () => {
   let resolveSettle: ((value: unknown) => void) | undefined;
   getAgentCapabilities.mockImplementation((query: { metrics_settle?: boolean; agent_id: string }) => {
@@ -880,7 +940,7 @@ it('does not leak delayed header or settle across server changes in the same sco
   expect(element.querySelector('[data-overview-fact="cost"]')?.textContent).toContain('$0.20');
 });
 
-it('discards the old settle when the source changes during its initial flight', async () => {
+it('keeps live usage visible when an old settle is discarded during its initial flight', async () => {
   const pending: Array<(value: unknown) => void> = [];
   getAgentCapabilities.mockImplementation((query: { metrics_settle?: boolean }) => {
     if (query.metrics_settle === true) return new Promise((resolve) => { pending.push(resolve); });
@@ -901,7 +961,8 @@ it('discards the old settle when the source changes during its initial flight', 
     });
   });
   await flushRender();
-  expect(element.querySelector('[data-overview-fact="tokens"]')).toBeNull();
+  expect(element.querySelector('[data-overview-fact="tokens"]')?.textContent).toContain('2.4k');
+  expect(element.querySelector('[data-metrics-counting]')).not.toBeNull();
   await act(async () => {
     pending[1]?.({
       context: 'live', owner: { agent_id: 'main' }, available: true, targets: [], tools: [], skills: [],
@@ -2066,14 +2127,14 @@ it('updates the selected agent window through serialized subscription ops, inclu
   }
 });
 
-it('keeps the folded profile independent of metrics settlement and reads only its opened catalog', async () => {
+it('loads the folded profile summary independently of metrics settlement', async () => {
   getAgentCapabilities.mockImplementation((query) => {
     expect(query.metrics_settle).not.toBe(true);
     expect(query.metrics_only).toBeUndefined();
     return Promise.resolve({ context: 'live', owner: { agent_id: query.agent_id }, available: true, tools: [], skills: [], targets: [] });
   });
   await render('main', { part: 'profile', forest: forestOf(['main', 'child']) });
-  expect(getAgentCapabilities).not.toHaveBeenCalled();
+  expect(getAgentCapabilities).toHaveBeenCalledTimes(1);
   const toggle = element.querySelector<HTMLButtonElement>('[data-profile-toggle]')!;
   await act(async () => { toggle.click(); });
   await flushRender();

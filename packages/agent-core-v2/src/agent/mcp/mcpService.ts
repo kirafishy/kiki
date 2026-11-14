@@ -784,7 +784,7 @@ export class AgentMcpService extends Service implements IAgentMcpService {
         .update(JSON.stringify({ tools: rawTools, enabledNames: enabledNamesSnapshot, collisions }))
         .digest('hex');
       const key = `${serverName}\n${hash}`;
-      if (this.states.get(mcpDiscoveryKey).seen.includes(key)) return;
+      if (this.states.get(mcpDiscoveryKey).seen.findLast((entry) => entry.startsWith(`${serverName}\n`)) === key) return;
       void this.dispatcher.dispatch(
         new McpToolsDiscovered({
           serverName,

@@ -18,6 +18,7 @@ import { AgentModelSwitch } from '#/agent/modelSwitch/modelSwitchEvent';
 import { effectiveToolBinding } from '#/agent/profile/toolBinding';
 import { subagentProfileName } from '#/session/agentLifecycle/subagentMetadata';
 import { LlmRequest, promptRequestEvidence } from '#/agent/llmRequester/llmRequestOps';
+import { McpToolsDiscovered } from '#/agent/mcp/mcpDiscoveryOps';
 
 type PersistedProfileFields = Pick<ProfileModelState,
   'personaId' | 'personaRevision' | 'personaOverrides' | 'persona' | 'roomPrompt' |
@@ -35,6 +36,7 @@ export interface PersistedAgentProfileSnapshot extends Omit<PersistedProfileFiel
   readonly activeToolNames?: readonly string[];
   readonly activeToolsKnown: boolean;
   readonly promptRequest?: import('@kiki/protocol').AgentPromptRequest;
+  readonly mcpTools?: readonly Pick<McpToolsDiscovered, 'serverName' | 'tools' | 'enabledNames' | 'collisions'>[];
 }
 
 export interface PersistedAgentProfileReadOptions {
@@ -75,6 +77,7 @@ const PROFILE_LINE_MARKERS = [
   `"type":"${ToolsSetActiveTools.type}"`,
   `"type":"${ToolsResetActiveTools.type}"`,
   `"type":"${LlmRequest.type}"`,
+  `"type":"${McpToolsDiscovered.type}"`,
 ];
 
 const PROFILE_EVENT_CLASSES: ReadonlyMap<string, Event2Class> = new Map<string, Event2Class>([
@@ -189,10 +192,16 @@ async function scanPersistedAgentProfileSnapshot(
   let activeToolsKnown = false;
   let profileStateSeen = false;
   let promptRequest: import('@kiki/protocol').AgentPromptRequest | undefined;
+  const mcpTools = new Map<string, McpToolsDiscovered>();
   for await (const record of records) {
     if (record.type === LlmRequest.type) {
       const request = event2FromRecord(LlmRequest, record);
       if (request instanceof LlmRequest) promptRequest = promptRequestEvidence(request);
+      continue;
+    }
+    if (record.type === McpToolsDiscovered.type) {
+      const discovery = event2FromRecord(McpToolsDiscovered, record);
+      if (discovery instanceof McpToolsDiscovered) mcpTools.set(discovery.serverName, discovery);
       continue;
     }
     const cls = PROFILE_EVENT_CLASSES.get(record.type);
@@ -258,6 +267,7 @@ async function scanPersistedAgentProfileSnapshot(
     appliedLease: state.appliedLease,
     boundProfile: state.boundProfile,
     promptRequest,
+    mcpTools: [...mcpTools.values()].map(({ serverName, tools, enabledNames, collisions }) => ({ serverName, tools, enabledNames, collisions })),
   };
 }
 

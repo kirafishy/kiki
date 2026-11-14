@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,10 +9,13 @@ import {
   IAgentProfileService,
   IAppendLogStore,
   IConfigService,
+  IWorkspaceInstanceManager,
   IFileSystemStorageService,
   ISessionAgentProfileCatalog,
   ISessionContext,
   ISessionManager,
+  ISessionMetadata,
+  ISessionToolPolicy,
   agentScopeOf,
   normalizeAgentProfile,
   sessionScopeOf,
@@ -20,6 +23,8 @@ import {
 } from '@kiki/agent-core-v2';
 import { ConfigUpdate } from '@kiki/agent-core-v2/agent/profile/profileOps';
 import { LlmRequest } from '@kiki/agent-core-v2/agent/llmRequester/llmRequestOps';
+import { McpConnectionManager } from '@kiki/agent-core-v2/mcpCore/connection-manager';
+import { McpToolsDiscovered } from '@kiki/agent-core-v2/agent/mcp/mcpDiscoveryOps';
 import { agentCapabilitiesResponseSchema, type AgentCapabilitiesResponse } from '@kiki/protocol';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { type RunningServer, startServer } from '../src/start';
@@ -351,6 +356,92 @@ describe('disposed agent capability snapshots', () => {
     expect(legacy.prompt?.request?.system_prompt_hash).toBe('legacy-hash');
     expect(legacy.prompt?.request?.anchor_applied).toBeUndefined();
     expect(legacy.prompt?.request?.anchor_scope).toBeUndefined();
+  });
+
+  it('projects configured tools, skills and dispatch policy for stopped and cold agents without restoring them', async () => {
+    await writeStubConfig(home);
+    await mkdir(join(home, 'skills', 'example-skill'), { recursive: true });
+    await writeFile(join(home, 'skills', 'example-skill', 'SKILL.md'), '---\nname: example-skill\ndescription: Example skill\n---\nRead the task.');
+    await start();
+    const registration = server!.core.accessor.get(IAgentProfileRegistry).register({
+      sourceId: 'snapshot-policy-fixture', priority: 40,
+      contribution: { profiles: [
+        normalizeAgentProfile({ name: 'snapshot-owner', modelAlias: 'stub', tools: ['Read', 'Skill', 'AgentRun', 'mcp__*'],
+          canSpawnSubagents: true, allowedSubagents: ['snapshot-leaf'], systemPrompt: () => '' }),
+        normalizeAgentProfile({ name: 'snapshot-leaf', modelAlias: 'stub', tools: ['Read', 'Skill'],
+          canSpawnSubagents: false, systemPrompt: () => '' }),
+      ] },
+    });
+    try {
+      const sessionId = await createSession();
+      const manager = server!.core.accessor.get(ISessionManager);
+      const session = manager.get(sessionId)!;
+      const lifecycle = session.accessor.get(IAgentLifecycleService);
+      for (const profile of ['snapshot-owner', 'snapshot-leaf']) {
+        await lifecycle.create({ agentId: profile, delegator: { kind: 'agent', agentId: 'main' }, binding: { profile, model: 'stub' } });
+        await lifecycle.remove(profile);
+      }
+      const scope = agentScopeOf(sessionScopeOf(workspacePersistenceScope('sessions', session.accessor.get(ISessionContext).workspaceId), sessionId), 'snapshot-owner');
+      const log = server!.core.accessor.get(IAppendLogStore);
+      log.append(scope, AGENT_WIRE_RECORD_KEY, new McpToolsDiscovered({ serverName: 'example', hash: 'example-discovery',
+        tools: [{ name: 'lookup', description: 'Look up an item', inputSchema: { type: 'object' } }], enabledNames: ['lookup'] }).serialize());
+      await log.flush(scope, AGENT_WIRE_RECORD_KEY);
+      const checkOwner = (data: AgentCapabilitiesResponse) => {
+        expect(data).toMatchObject({ live: false, available: true, profile: { name: 'snapshot-owner', can_spawn_subagents: true } });
+        expect(data.tools).toEqual(expect.arrayContaining([
+          expect.objectContaining({ name: 'Read', state: 'unknown', policy_allowed: true, unavailable_reason_code: 'snapshot_inventory_only' }),
+          expect.objectContaining({ name: 'mcp__example__lookup', source: 'mcp', state: 'unknown', policy_allowed: true }),
+        ]));
+        expect(data.skills).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'example-skill', state: 'unknown', unavailable_reason_code: 'snapshot_inventory_only' })]));
+        expect(data.targets.find((target) => target.profile === 'snapshot-leaf')).toMatchObject({
+          defaults_available: true, launch_unavailable_reason_code: 'snapshot_launch_unavailable',
+        });
+      };
+      checkOwner(await readCapabilities(sessionId, 'snapshot-owner'));
+      const leaf = await readCapabilities(sessionId, 'snapshot-leaf');
+      expect(leaf.profile?.can_spawn_subagents).toBe(false);
+      expect(leaf.tools?.find((tool) => tool.name === 'AgentRun')?.state).toBe('disabled');
+      expect(leaf.targets.every((target) => target.launch_unavailable_reason_code !== 'snapshot_launch_unavailable')).toBe(true);
+      const workspaceId = session.accessor.get(ISessionContext).workspaceId;
+      await manager.close(sessionId);
+      expect(manager.get(sessionId)).toBeUndefined();
+      const resume = vi.spyOn(manager, 'resume');
+      const workspaceManager = server!.core.accessor.get(IWorkspaceInstanceManager);
+      await workspaceManager.close(workspaceId);
+      await writeFile(join(home, 'mcp.json'), JSON.stringify({ mcpServers: { example: { command: 'example-mcp-server' } } }));
+      const acquire = vi.spyOn(workspaceManager, 'acquire');
+      const connect = vi.spyOn(McpConnectionManager.prototype, 'connectAll');
+      checkOwner(await readCapabilities(sessionId, 'snapshot-owner'));
+      const main = await readCapabilities(sessionId, 'main');
+      expect(main).toMatchObject({ live: false, available: true, profile: { name: 'agent' } });
+      expect(main.tools?.some((tool) => tool.policy_allowed === true)).toBe(true);
+      expect(main.skills?.some((skill) => skill.name === 'example-skill')).toBe(true);
+      expect(main.targets.length).toBeGreaterThan(0);
+      expect(resume).not.toHaveBeenCalled();
+      expect(acquire).not.toHaveBeenCalled();
+      expect(connect).not.toHaveBeenCalled();
+      expect(workspaceManager.get(workspaceId)).toBeUndefined();
+      expect(manager.get(sessionId)).toBeUndefined();
+    } finally { await registration.dispose(); }
+  });
+
+  it('reads cold metadata-only bindings and saved tool policy when no inline profile was recorded', async () => {
+    await writeStubConfig(home);
+    await start();
+    const sessionId = await createSession();
+    const manager = server!.core.accessor.get(ISessionManager);
+    const session = manager.get(sessionId)!;
+    const metadata = session.accessor.get(ISessionMetadata);
+    await metadata.registerAgent('metadata-child', { type: 'sub', parentAgentId: 'main', model: 'stub', labels: { profileName: 'explore' } });
+    await session.accessor.get(ISessionToolPolicy).setDisabledTools(['Read']);
+    await manager.close(sessionId);
+    const data = await readCapabilities(sessionId, 'metadata-child');
+    expect(data).toMatchObject({ live: false, available: true, profile: { name: 'explore', model: 'stub', can_spawn_subagents: false } });
+    expect(data.tools?.find((tool) => tool.name === 'Read')).toMatchObject({ state: 'disabled', policy_allowed: false });
+    expect(data.tools?.some((tool) => tool.policy_allowed === true)).toBe(true);
+    expect(data.skills).toBeDefined();
+    expect(data.targets).toBeDefined();
+    expect(manager.get(sessionId)).toBeUndefined();
   });
 
   async function start(): Promise<void> {

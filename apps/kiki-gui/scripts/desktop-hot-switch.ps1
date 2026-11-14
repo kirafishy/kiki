@@ -51,7 +51,9 @@ function Try-RuntimeSwitch([object]$Server, [string]$OperationId, [string]$Actio
     try {
         Call-Local $Server 'runtime-switch' @{ operationId = $OperationId; serverId = $Server.server_id; action = $Action } | Out-Null
     } catch {
-        if ($_.Exception.Response.StatusCode.value__ -ne 404) { Write-Verbose "runtime-switch ($Action) skipped: $($_.Exception.Message)" }
+        $responseProperty = $_.Exception.PSObject.Properties['Response']
+        $response = if ($null -ne $responseProperty) { $responseProperty.Value } else { $null }
+        if ($null -eq $response -or $response.StatusCode.value__ -ne 404) { Write-Verbose "runtime-switch ($Action) skipped: $($_.Exception.Message)" }
     }
 }
 

@@ -67,6 +67,22 @@ describe('readPersistedAgentProfileSnapshot', () => {
     expect(streamReads).toBe(1);
   });
 
+  it('keeps the latest persisted MCP inventory per server beside the profile', async () => {
+    const records = [
+      { type: 'config.update', modelAlias: 'from-wire', time: 1 },
+      { type: 'mcp.tools_discovered', serverName: 'example', hash: 'first', tools: [{ name: 'old', description: 'Old', inputSchema: {} }], enabledNames: ['old'], time: 2 },
+      { type: 'mcp.tools_discovered', serverName: 'example', hash: 'latest', tools: [{ name: 'lookup', description: 'Lookup', inputSchema: {} }], enabledNames: ['lookup'], time: 3 },
+    ];
+    const bytes = Buffer.from(records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    const host = {
+      storage: { size: async () => bytes.length, mtime: async () => 1, pathFor: () => undefined, read: async () => undefined,
+        readStream: async function* () { yield bytes; } },
+      appendLog: { flush: async () => undefined },
+    };
+    const snapshot = await readPersistedAgentProfileSnapshot(host as never, 'workspace', 'session', 'main', undefined);
+    expect(snapshot?.mcpTools).toEqual([{ serverName: 'example', tools: records[2]!.tools, enabledNames: ['lookup'], collisions: undefined }]);
+  });
+
   it('folds profile lines from the wire stream and does not parse unrelated records', async () => {
     const noise = `this is not json ${'x'.repeat(64)}\n`;
     const request = `{"type":"llm.request","pad":"${'y'.repeat(1_100_000)}\n`;

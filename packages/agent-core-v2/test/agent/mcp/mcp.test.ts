@@ -1962,6 +1962,15 @@ describe('AgentMcpService', () => {
       manager.connect('grafana');
       await wire.flush();
       expect(records).toHaveLength(2);
+      manager.setResolved('grafana', client, await discoverTools(client), new Set(['query_range']), rawTools);
+      manager.connect('grafana');
+      await wire.flush();
+      expect(records).toHaveLength(3);
+      expect(records[2]).toMatchObject({ enabledNames: ['query_range'] });
+      expect(ix.get(IAgentStateService).get(mcpDiscoveryKey).seen).toHaveLength(1);
+      manager.connect('grafana');
+      await wire.flush();
+      expect(records).toHaveLength(3);
     } finally {
       off.dispose();
     }

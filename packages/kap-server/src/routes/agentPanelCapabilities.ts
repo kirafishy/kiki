@@ -11,7 +11,6 @@ import {
   ISubagentTool,
   ISessionAgentProfileCatalog,
   ISessionContext,
-  ISessionToolPolicy,
   type IAgentScopeHandle,
   type PluginToolRegistration,
   type ProfileData,
@@ -22,6 +21,7 @@ import type { SkillDefinition } from '@kiki/agent-core-v2/app/skillCatalog/types
 import { IAgentToolActivationService } from '@kiki/agent-core-v2/agent/toolActivation/toolActivation';
 import { IAgentMcpService } from '@kiki/agent-core-v2/agent/mcp/mcp';
 import { qualifyMcpToolName } from '@kiki/agent-core-v2/mcpCore/tool-naming';
+import { assertMcpInputSchema } from '@kiki/agent-core-v2/mcpCore/types';
 import { IAgentToolSelectService } from '@kiki/agent-core-v2/agent/toolSelect/toolSelect';
 import { isToolActiveComposed, type GlobalToolsPolicy } from '@kiki/agent-core-v2/agent/toolPolicy/evaluate';
 import { isAgentNotifyAvailable } from '@kiki/agent-core-v2/agent/tools/agent-notify/agent-notify';
@@ -35,7 +35,6 @@ import {
 } from '@kiki/agent-core-v2/session/agentCollaboration/configSection';
 import { ISessionInteractionService } from '@kiki/agent-core-v2/session/interaction/interaction';
 import { ISessionSkillCatalog } from '@kiki/agent-core-v2/session/sessionSkillCatalog/skillCatalog';
-import { ISessionToolPolicyGate } from '@kiki/agent-core-v2/session/sessionToolPolicyGate/sessionToolPolicyGate';
 import { resolveRoleThinkingDefault, roleConstraintsFromProfile } from '@kiki/agent-core-v2/session/subagent/modelConstraints';
 import { SUBAGENT_SECTION, type SubagentConfig } from '@kiki/agent-core-v2/session/subagent/configSection';
 import {
@@ -110,6 +109,11 @@ export async function snapshotPanelCapabilities(
   snapshot: PersistedAgentProfileSnapshot,
   resolution: PanelProfileResolution & { readonly profile: PanelProfileDefinition },
   hasParent: boolean,
+  inventory: {
+    readonly skills: readonly SkillDefinition[];
+    readonly workspaceDisabledTools?: readonly string[];
+    readonly sessionDisabledTools?: readonly string[];
+  },
 ): Promise<Pick<AgentCapabilitiesProducerResponse, 'profile' | 'tools' | 'skills'>> {
   const definition = resolution.profile;
   const persisted = snapshot.source === 'wire';
@@ -131,10 +135,7 @@ export async function snapshotPanelCapabilities(
     serviceTier: snapshot.serviceTier ?? definition.serviceTier,
     profileSource: snapshot.boundProfile?.fileSources === undefined ? 'registered' : 'profile-file',
   };
-  const sessionPolicy = session.accessor.get(ISessionToolPolicy);
-  const skills = session.accessor.get(ISessionSkillCatalog);
   const config = session.accessor.get(IConfigService);
-  await Promise.all([sessionPolicy.ready, skills.ready]);
   const policy = {
     profile: {
       executionRestriction: binding.executionRestriction,
@@ -144,8 +145,8 @@ export async function snapshotPanelCapabilities(
       disabledToolGroups: binding.disabledToolGroups,
     },
     global: config.get<GlobalToolsPolicy>('tools'),
-    workspaceDisabledTools: session.accessor.get(ISessionToolPolicyGate).disabledTools,
-    sessionDisabledTools: sessionPolicy.disabledTools(),
+    workspaceDisabledTools: inventory.workspaceDisabledTools,
+    sessionDisabledTools: inventory.sessionDisabledTools,
     subagent: hasParent ? {
       allowedTools: config.get<SubagentConfig>(SUBAGENT_SECTION)?.allowedTools,
       explicitProfileTools,
@@ -177,16 +178,31 @@ export async function snapshotPanelCapabilities(
       category: options.domain ?? 'other',
       group: toolGroupForName(options.name),
       state,
+      policy_allowed: available,
       unavailable_reason: toolUnavailableReason,
       unavailable_reason_code: toolUnavailableReasonCode,
       read_only: binding.executionRestriction === 'research-readonly' || READ_ONLY_DISPLAY_TOOL_NAMES.has(options.name)
         ? true : undefined,
     };
   });
+  for (const server of snapshot.mcpTools ?? []) {
+    for (const tool of server.tools) {
+      const name = qualifyMcpToolName(server.serverName, tool.name);
+      if (server.collisions?.some((collision) => collision.toolName === tool.name) === true) continue;
+      const active = server.enabledNames.includes(tool.name) && isToolActiveComposed(policy, name, 'mcp');
+      tools.push({
+        name, description: tool.description, source: 'mcp', category: 'mcp',
+        state: active ? 'unknown' : 'disabled', policy_allowed: active,
+        unavailable_reason: active ? unavailableReason : 'Disabled by effective tool policy',
+        unavailable_reason_code: active ? unavailableReasonCode : 'tool_policy_disabled',
+        parameters: assertMcpInputSchema(tool.name, tool.inputSchema),
+      });
+    }
+  }
   return {
     profile: panelProfile(session, binding, resolution, hasParent ? 'sub' : 'main'),
     tools: tools.toSorted((a, b) => a.name.localeCompare(b.name)),
-    skills: panelSkills(skills.catalog.listSkills(), isToolActiveComposed(policy, 'Skill')).map((skill) => ({
+    skills: panelSkills(inventory.skills, isToolActiveComposed(policy, 'Skill')).map((skill) => ({
       ...skill,
       state: skill.state === 'enabled' ? 'unknown' : skill.state,
       unavailable_reason: skill.unavailable_reason ?? unavailableReason,

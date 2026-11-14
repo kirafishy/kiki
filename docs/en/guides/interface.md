@@ -72,15 +72,17 @@ An approval appears in the timeline before a protected operation runs, with the 
 
 ## Right rail
 
-The rail describes one agent at a time — whichever you last clicked into or focused. The main agent and every subagent get the same page, and the rail follows you into a subagent's transcript. It shows what that agent is doing now, items waiting on you, the activity feed, and two independently folded capability sections.
+The rail describes one agent at a time — whichever you last clicked into or focused. The main agent and every subagent get the same page, and the rail follows you into a subagent's transcript. It shows what that agent is doing now, items waiting on you, the activity feed, and a **Capabilities** fold.
 
 For the native executor, the context overview uses the selected agent's current effective model limit, including its bound profile and recipe constraints. Changing that model's configured limit refreshes the window, percentage and automatic-compaction point in open main and subagent views. An unavailable limit leaves the token count visible without a percentage; recorded usage for earlier turns stays unchanged.
 
+The session overview keeps known token subtotals visible while counting continues. **Cockpit** shows the whole-session token total beside cost and turns; an incomplete count retains its counting or partial marker.
+
 The agent tree labels external executors beside each agent's name. An **off** thinking effort is shown only when it was explicitly selected.
 
-**Capability inventory** has **Tools**, **Skills**, and **Subagents** tabs. The tools list includes plugin and MCP tools. Each subagent row names the profile and route, and whether that child can be launched now. Who this agent may start is set on the profile under **Child agents** — see [Dispatch capabilities](./settings.md#dispatch-capabilities).
+The **Capabilities** summary counts enabled tools, invocable skills and permitted subagent targets, including a stopped agent's saved inventory. Expand it for **Tools**, **Skills**, and **Subagents** tabs; tool details keep runtime connection status separate from saved access. The tools list includes plugin and MCP tools. Each subagent row names the profile and route, and whether that child can be launched now. Who this agent may start is set on the profile under **Child agents** — see [Dispatch capabilities](./settings.md#dispatch-capabilities).
 
-**Capability controls** holds plugin usage, system-capability switches, and MCP server choices for this conversation. These controls stay separate from the inventory. Enabling **Browser** allows browser tools within the current tool policy; browser settings show the available connections and any connection failures. Ego Lite uses the native `browser__ego_run` tool rather than a separate list of typed page tools.
+Below the inventory, **Capabilities** holds plugin usage, system-capability switches, and MCP server choices for this conversation. Enabling **Browser** allows browser tools within the current tool policy; browser settings show the available connections and any connection failures. Ego Lite uses the native `browser__ego_run` tool rather than a separate list of typed page tools.
 
 **IM conversation** lists the channels bound to this conversation, with a separate switch for each binding. Channels from one account, including Telegram topics, can belong to different conversations. An unrelated account's reconnecting state does not appear here. When an incoming channel is awaiting confirmation, **Bind here** explicitly links it to this conversation.
 

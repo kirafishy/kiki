@@ -52,14 +52,14 @@ export function toolGroupOrigin(t: Translate, group: ToolGroup): string | undefi
  * have the room to say what the numbers are.
  */
 export function toolGroupCountLine(t: Translate, counts: ToolGroupCounts): string {
-  return counts.total > 0 && counts.unknown === counts.total
+  return counts.total > 0 && counts.on === 0 && counts.unknown === counts.total
     ? t('inspector.cap.groupCountUnknown', { total: counts.total })
     : t('inspector.cap.groupCount', { on: counts.on, total: counts.total });
 }
 
 /** `x/y`, or `?/y` when nothing in the group has a known state: the chip's own text and the group panel's meta line. */
 export function toolGroupCountRatio(t: Translate, counts: ToolGroupCounts): string {
-  return counts.total > 0 && counts.unknown === counts.total
+  return counts.total > 0 && counts.on === 0 && counts.unknown === counts.total
     ? t('inspector.cap.groupCountRatioUnknown', { total: counts.total })
     : t('inspector.cap.groupCountRatio', { on: counts.on, total: counts.total });
 }

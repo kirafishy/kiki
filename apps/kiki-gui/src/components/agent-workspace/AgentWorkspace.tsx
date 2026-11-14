@@ -1373,6 +1373,7 @@ function ChildAgentWorkspace({
   // them on every render (each composer keystroke) re-rendered the timeline.
   const agentState = useMemo<SessionViewState>(() => ({
     ...agentLiveState,
+    session: sessionState.session,
     blocks: agentBlocks,
     busy: headerBusy,
     model: displayModel,
@@ -1383,7 +1384,7 @@ function ChildAgentWorkspace({
     usage: displayUsage,
     pendingInteraction: 'none',
   }), [
-    agentLiveState, agentBlocks, headerBusy, displayModel,
+    agentLiveState, sessionState.session, agentBlocks, headerBusy, displayModel,
     displayEffort, displayContextTokens, displayMaxContextTokens, displayUsage,
   ]);
   const timelineState = useMemo(

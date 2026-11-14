@@ -1123,7 +1123,11 @@ export const CockpitOverview = memo(function CockpitOverview({ sessionId, agentI
           scope={t(treeFigures?.incomplete === true ? 'rail.cockpit.scope.treePartial' : 'rail.cockpit.scope.tree')}
         />
       </div>
-      <dl className="grid grid-cols-2 divide-x divide-hairline text-center">
+      <dl className="grid grid-cols-3 divide-x divide-hairline text-center">
+        <div data-cockpit-fact="tokens">
+          <dt className="text-[11.5px] text-ink-faint">{t('inspector.tokens')}</dt>
+          <dd className="font-mono text-[14px] text-ink tabular-nums">{tokens(treeFigures?.totalTokens ?? figures.totalTokens)}</dd>
+        </div>
         <div data-cockpit-fact="cost">
           <dt className="text-[11.5px] text-ink-faint">{t('rail.cockpit.scope.tree')} · {t('inspector.cost')}</dt>
           <dd className="font-mono text-[14px] text-ink tabular-nums">{money(cost)}</dd>
