@@ -24,6 +24,7 @@ import {
 } from '#/agent/media/image-compress';
 import { sniffImageDimensions } from '#/agent/media/file-type';
 import { decodeImageVerdict, decodeToJimp } from '#/agent/media/imageDecode';
+import { pngWithoutAncillaryChunks } from '#/agent/media/pngDecode';
 import * as cpuRuntime from '#/app/cpuWorker/runtime';
 import {
   normalizeImageMime,
@@ -299,6 +300,26 @@ describe('PNG ancillary recovery', () => {
       expect(await validateImageDataUrl(`data:image/png;base64,${png.toString('base64')}`)).toBeNull();
     } finally { await cpuRuntime.closeCpuPool(); }
   }, PARALLEL_WORKER_CONTENTION_TIMEOUT_MS);
+
+  it.each(['bad-ihdr-crc', 'bad-idat-crc', 'oversized-dimensions'] as const)('rejects %s before PNG pixel inflation', mode => {
+    const header = Buffer.alloc(13);
+    header.writeUInt32BE(mode === 'oversized-dimensions' ? 16_384 : 16, 0);
+    header.writeUInt32BE(mode === 'oversized-dimensions' ? 16_384 : 16, 4);
+    header[8] = 8;
+    header[9] = 6;
+    const ihdr = pngChunk('IHDR', header);
+    if (mode === 'bad-ihdr-crc') ihdr[ihdr.length - 1]! ^= 1;
+    const idat = pngChunk('IDAT', Buffer.from('not-valid-zlib-stream'));
+    if (mode === 'bad-idat-crc') idat[idat.length - 1]! ^= 1;
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      ihdr,
+      pngChunk('tEXt', Buffer.from('Comment\0x')),
+      idat,
+      pngChunk('IEND', Buffer.alloc(0)),
+    ]);
+    expect(pngWithoutAncillaryChunks(png)).toBeUndefined();
+  });
 
   it('rejects truncated base64 before scheduling image decoding', async () => {
     const png = await solidPng(7, 5);
