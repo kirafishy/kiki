@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DisposableStore } from '#/_base/di/lifecycle';
 import { TestInstantiationService } from '#/_base/di/test';
 import { SyncDescriptor } from '#/_base/di/descriptors';
 import { IAskUserQuestionTool } from '#/agent/tools/ask-user-question/ask-user-question';
@@ -29,6 +30,8 @@ import type { QuestionBackgroundTask } from '#/agent/tools/ask-user-question/que
 import { executeTool } from '../../../tools/fixtures/execute-tool';
 
 const signal = new AbortController().signal;
+const disposables = new DisposableStore();
+afterEach(async () => { await disposables.clear(); });
 
 function input(
   overrides: Partial<AskUserQuestionInput['questions'][number]> = {},
@@ -62,7 +65,7 @@ function makeTool(
     ) => Promise<QuestionResult>;
   } = {},
 ): {
-  readonly tool: AskUserQuestionTool;
+  readonly tool: IAskUserQuestionTool;
   readonly request: ReturnType<typeof vi.fn>;
   readonly telemetryTrack: ReturnType<typeof vi.fn>;
   readonly registerTask: ReturnType<typeof vi.fn>;
@@ -84,8 +87,14 @@ function makeTool(
   const tasks = { registerTask, getTask } as unknown as IAgentTaskService;
   const scopeContext = { agentId: 'main' } as unknown as IAgentScopeContext;
   const config = { get: () => ({ askUserQuestion: options.blocking ? 'blocking' : 'background' }) } as unknown as IConfigService;
-  const tool = new AskUserQuestionTool(question, telemetry, tasks, scopeContext, config);
-  return { tool, request, telemetryTrack, registerTask, getTask, lastRegisteredTask: () => lastTask };
+  const ix = disposables.add(new TestInstantiationService());
+  ix.set(QuestionId, question);
+  ix.set(ITelemetryService, telemetry);
+  ix.set(IAgentTaskService, tasks);
+  ix.set(IAgentScopeContext, scopeContext);
+  ix.set(ConfigId, config);
+  ix.set(IAskUserQuestionTool, new SyncDescriptor(AskUserQuestionTool));
+  return { tool: ix.get(IAskUserQuestionTool), request, telemetryTrack, registerTask, getTask, lastRegisteredTask: () => lastTask };
 }
 
 describe('AskUserQuestionTool', () => {
@@ -110,6 +119,7 @@ describe('AskUserQuestionTool', () => {
       turn = { turnId: 1, origin: { kind: 'room_message', roomId: 'room-a', messageId: 'row-1', targeted: true }, phase: 'tool_call', step: 1, pendingApprovals: [], activeToolCalls: [], since: 0, ending: false };
       const result = await executeTool(tool, { turnId: 1, toolCallId: 'room-question', args: input(), signal });
       expect(result.isError).toBe(false);
+      expect('allowsTurnEndWithSendMessage' in result && result.allowsTurnEndWithSendMessage).toBe(true);
       expect(result.output).toContain('automatic_notification: true');
       expect(registerTask).toHaveBeenCalledOnce();
     } finally { await ix.dispose(); }
@@ -244,6 +254,7 @@ describe('AskUserQuestionTool', () => {
     });
 
     expect(result.isError).toBe(false);
+    expect('allowsTurnEndWithSendMessage' in result ? result.allowsTurnEndWithSendMessage : undefined).toBeUndefined();
     expect(result.output).toBe(JSON.stringify({ answers: { Postgres: true } }));
     expect(request).toHaveBeenCalledWith(
       {
@@ -457,6 +468,7 @@ describe('AskUserQuestionTool', () => {
       });
 
       expect(result.isError).toBe(false);
+      expect('allowsTurnEndWithSendMessage' in result && result.allowsTurnEndWithSendMessage).toBe(true);
       expect(typeof result.output).toBe('string');
       const output = result.output as string;
       expect(output).toContain('task_id: q_test_task_id');

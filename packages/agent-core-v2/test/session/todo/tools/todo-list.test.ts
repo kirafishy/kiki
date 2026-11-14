@@ -60,7 +60,7 @@ describe('TodoListTool', () => {
   it('query mode renders the current list without mutating it', async () => {
     const fixture = makeTool([{ title: 'existing', status: 'in_progress' }]);
     const result = await executeTool(fixture.tool, { turnId: 1, toolCallId: 'read', args: {}, signal });
-    expect(result).toMatchObject({ isError: false });
+    expect(result).toMatchObject({ isError: false, allowsTurnEndWithSendMessage: true });
     expect(result.output).toContain('[in_progress] existing');
     expect(fixture.getTodos()).toEqual([{ title: 'existing', status: 'in_progress' }]);
     await fixture.dispose();
@@ -71,6 +71,7 @@ describe('TodoListTool', () => {
     const todos: TodoItem[] = [{ title: 'first', status: 'pending' }, { title: 'second', status: 'in_progress' }];
     const result = await executeTool(fixture.tool, { turnId: 1, toolCallId: 'write', args: { todos }, signal });
     todos[0] = { title: 'leaked', status: 'done' };
+    expect(result).toMatchObject({ isError: false, allowsTurnEndWithSendMessage: true });
     expect(receipt(result.output)).toMatchObject({ changed: ['todos'], todos: { count: 2, pending: 1, in_progress: 1, done: 0 } });
     expect(result.output).not.toContain('first');
     expect(fixture.getTodos()).toEqual([{ title: 'first', status: 'pending' }, { title: 'second', status: 'in_progress' }]);
@@ -131,6 +132,7 @@ describe('TodoListTool', () => {
     for (const notes of [{ goal: 'x'.repeat(1501) }, Object.fromEntries(NOTE_SECTIONS.map((section) => [section, section.repeat(300).slice(0, 1500)]))]) {
       const result = await invoke({ notes, todos: [] });
       expect(result.isError).toBe(true);
+      expect('allowsTurnEndWithSendMessage' in result ? result.allowsTurnEndWithSendMessage : undefined).toBeUndefined();
       expect(fixture.getNotes()).toEqual({ goal: 'keep' });
       expect(fixture.getTodos()).toEqual([{ title: 'keep', status: 'pending' }]);
     }

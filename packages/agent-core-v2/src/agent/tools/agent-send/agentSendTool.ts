@@ -82,6 +82,7 @@ export class AgentSendTool implements IAgentSendTool {
         );
       }
       return {
+        allowsTurnEndWithSendMessage: true,
         output: JSON.stringify({
           message_id: acceptance.message.messageId,
           status: acceptance.delivery,

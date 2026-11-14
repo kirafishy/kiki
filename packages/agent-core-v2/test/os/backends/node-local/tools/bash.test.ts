@@ -1631,6 +1631,7 @@ describe('BashTool background mode', () => {
     expect(result).toMatchObject({ isError: false });
     expect(result.output).toContain('before detach\n');
     expect(result.output).not.toContain('after detach\n');
+    expect(result).toMatchObject({ allowsTurnEndWithSendMessage: undefined });
     expect(result.output).toContain(`task_id: ${task.taskId}`);
     expect(result.output).toContain('automatic_notification: true');
     expect(result.output).toContain('next_step: Continue your current work; completion arrives automatically.');
@@ -1710,6 +1711,7 @@ describe('BashTool background mode', () => {
       expect(proc.kill).not.toHaveBeenCalled();
       expect(result).toMatchObject({
         isError: false,
+        allowsTurnEndWithSendMessage: undefined,
         brief: expect.stringContaining('after timeout'),
       });
       const taskId = /^task_id: (\S+)/m.exec(result.output as string)?.[1];
@@ -1823,6 +1825,7 @@ describe('BashTool background mode', () => {
       context({ command: 'sleep 10', run_in_background: true, description: 'long running task' }),
     );
 
+    expect(result).toMatchObject({ allowsTurnEndWithSendMessage: true });
     expect(result.output).toMatch(/task_id: bash-[0-9a-z]{8}/);
     expect(result.output).toContain('automatic_notification: true');
     expect((result as { brief?: string }).brief).toMatch(/^Started bash-[0-9a-z]{8}$/);

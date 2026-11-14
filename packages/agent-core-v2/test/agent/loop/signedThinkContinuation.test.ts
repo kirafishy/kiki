@@ -7,6 +7,7 @@ import { IAgentPromptService } from '#/agent/prompt/prompt';
 import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
 import { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
 import { IAgentUsageService } from '#/agent/usage/usage';
+import { ISessionDeliveryService } from '#/session/delivery/delivery';
 import type { ChatProvider } from '#/kosong/contract/provider';
 import { AnthropicChatProvider } from '#/kosong/provider/bases/anthropic/anthropic';
 import { ProtocolAdapterRegistry } from '#/kosong/provider/protocolAdapterRegistry';
@@ -124,6 +125,51 @@ describe('thinking-only continuation', () => {
       expect(signaturesOf(create.mock.calls[1]?.[0])).toEqual([]);
       expect(promptCount(create.mock.calls[2]?.[0], 'Complete work.')).toBe(1);
       expect(blockTypeCount(create.mock.calls[2]?.[0], 'tool_use')).toBe(1);
+      await local.expectResumeMatches();
+    } finally {
+      await local.dispose();
+    }
+  });
+
+  it.each(['normal', 'classified'] as const)('renews the continuation budget after a successful tool step between %s thinking-only stops', async (kind) => {
+    const think = kind === 'normal' ? unsignedThinkStream : gatewayNoUsableAnswerStream;
+    const create = scriptedCreate([think(), toolStream(), think(), textStream('Recovered twice.')]);
+    const local = anthropicAgent(create, { permission: 'yolo' });
+    const run = vi.fn(async () => ({ output: 'Work saved.' }));
+    local.get(IAgentToolRegistryService).register({
+      name: 'FinishWork', description: 'Complete work.', parameters: { type: 'object' },
+      resolveExecution: () => ({ approvalRule: 'FinishWork', execute: run }),
+    });
+    local.get(IAgentProfileService).update({ activeToolNames: ['FinishWork'] });
+    try {
+      const terminal = await (await prompt(local)).completion;
+      expect(terminal).toMatchObject({ state: 'completed', result: { type: 'completed', steps: 4 } });
+      expect(create).toHaveBeenCalledTimes(4);
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(promptCount(create.mock.calls[3]?.[0], CONTINUE)).toBe(2);
+      await local.expectResumeMatches();
+    } finally {
+      await local.dispose();
+    }
+  });
+
+  it.each(['normal', 'classified'] as const)('preserves a %s Anthropic thinking-only response and quietly completes after SendMessage delivery', async (kind) => {
+    const create = scriptedCreate([
+      toolStream(undefined, 'SendMessage', { text: 'Already delivered.' }),
+      kind === 'normal' ? signedThinkStream('end_turn') : gatewayNoUsableAnswerStream(),
+    ]);
+    const local = anthropicAgent(create, { permission: 'yolo' });
+    const delivery = local.get(ISessionDeliveryService);
+    await delivery.ready;
+    await delivery.set('message');
+    try {
+      const terminal = await (await prompt(local)).completion;
+      expect(terminal).toMatchObject({ state: 'completed', result: { type: 'completed', steps: 2 } });
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(storedThinking(local)).toContainEqual(kind === 'normal'
+        ? { type: 'think', think: THINKING, encrypted: SIGNATURE }
+        : { type: 'think', think: 'plan', encrypted: 'sig-plan' });
+      expect(continued(local)).toBe(false);
       await local.expectResumeMatches();
     } finally {
       await local.dispose();
@@ -518,7 +564,7 @@ describe('thinking-only continuation', () => {
     }
   });
 
-  it('renews the one-continuation budget only in a new turn and keeps one usage fact per model call', async () => {
+  it('starts a new turn with a fresh continuation budget and keeps one usage fact per model call', async () => {
     const create = scriptedCreate([signedThinkStream('end_turn'), textStream('first result'), signedThinkStream('end_turn'), textStream('second result')]);
     const local = anthropicAgent(create);
     try {
@@ -1129,11 +1175,11 @@ function textStream(text: string): () => AsyncGenerator<Record<string, unknown>>
   };
 }
 
-function toolStream(signature?: string): () => AsyncGenerator<Record<string, unknown>> {
+function toolStream(signature?: string, name = 'FinishWork', input: Record<string, unknown> = {}): () => AsyncGenerator<Record<string, unknown>> {
   return async function* tool() {
     yield { type: 'message_start', message: { id: 'tool-1', usage: { input_tokens: 6, output_tokens: 0 } } };
-    yield { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'call-work', name: 'FinishWork', signature } };
-    yield { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{}' } };
+    yield { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'call-work', name, signature } };
+    yield { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) } };
     yield { type: 'content_block_stop', index: 0 };
     yield { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 3 } };
     yield { type: 'message_stop' };

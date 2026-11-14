@@ -246,6 +246,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
     const binding = this.instantiation.invokeFunction(accessor => accessor.get(IAgentProfileService).data());
     return {
       turnId: runtime.turnId, completedSteps: runtime.steps,
+      userDeliveryConfirmed: runtime.userDeliveryConfirmed,
       pendingStep: runtime.pendingStep,
       seed: runtime.job.seed, binding: structuredClone(binding),
     };
@@ -1135,7 +1136,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
       queue: job?.queue ?? this.standaloneStepQueue,
       steps: job?.restored?.completedSteps ?? 0,
       pendingStep: job?.restored?.pendingStep,
-      userDeliveryConfirmed: job?.restored?.pendingStep?.userDeliveryConfirmed ?? false,
+      userDeliveryConfirmed: job?.restored?.userDeliveryConfirmed ?? job?.restored?.pendingStep?.userDeliveryConfirmed ?? false,
       thinkingOnlyContinuations: 0,
       extensionRecoveryStreak: 0,
       extensionBudgetUsed: 0,
@@ -1496,33 +1497,6 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
           !signal.aborted &&
           !turnSignal.aborted &&
           !isAbortError(error) &&
-          readProviderEventErrorCode(error) === THINKING_ONLY_PROVIDER_ERROR_CODE &&
-          facts !== undefined &&
-          facts.message.partial !== true &&
-          retained.thinkingOnly &&
-          retained.hasRealThinking &&
-          this.thinkingOnlyContinuationEnabled() &&
-          continuationBudget.thinkingOnlyContinuations < 1
-        ) {
-          const usage = facts.usage ?? undefined;
-          this.appendStepEnd({
-            type: 'step.end',
-            uuid: stepUuid,
-            turnId: String(turnId),
-            step: currentStep,
-            finishReason: 'other',
-            usage,
-          });
-          stepEndAppended = true;
-          continuationBudget.thinkingOnlyContinuations += 1;
-          this.enqueue(new ThinkingOnlyContinuationStepRequest());
-          await this.runBoundaryRequests(turnId, signal);
-          return { stopReason: 'other', hookStopTurn: false };
-        }
-        if (
-          !signal.aborted &&
-          !turnSignal.aborted &&
-          !isAbortError(error) &&
           this.scope.parentAgentId === undefined &&
           plainToolContinuation &&
           continuationBudget.userDeliveryConfirmed &&
@@ -1556,12 +1530,44 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
           await this.runBoundaryRequests(turnId, signal);
           return { stopReason: 'completed', hookStopTurn };
         }
+        if (
+          !signal.aborted &&
+          !turnSignal.aborted &&
+          !isAbortError(error) &&
+          readProviderEventErrorCode(error) === THINKING_ONLY_PROVIDER_ERROR_CODE &&
+          facts !== undefined &&
+          facts.message.partial !== true &&
+          retained.thinkingOnly &&
+          retained.hasRealThinking &&
+          this.thinkingOnlyContinuationEnabled() &&
+          continuationBudget.thinkingOnlyContinuations < 1
+        ) {
+          const usage = facts.usage ?? undefined;
+          this.appendStepEnd({
+            type: 'step.end',
+            uuid: stepUuid,
+            turnId: String(turnId),
+            step: currentStep,
+            finishReason: 'other',
+            usage,
+          });
+          stepEndAppended = true;
+          continuationBudget.thinkingOnlyContinuations += 1;
+          this.enqueue(new ThinkingOnlyContinuationStepRequest());
+          await this.runBoundaryRequests(turnId, signal);
+          return { stopReason: 'other', hookStopTurn: false };
+        }
         throw error;
       }
       continuationBudget.deliveryPhase = 'partial_output_unclosed';
       continuationBudget.extensionRecoveryStreak = 0;
       this.lastRequestTraceId = request.trace.traceId;
-      const googleThinkSnapshot = isThinkOnlyCompletion(response) && this.llmRequester.supportsAssistantPrefill?.() === false;
+      const silentPostDeliveryTurnEnd = this.scope.parentAgentId === undefined &&
+        plainToolContinuation && continuationBudget.userDeliveryConfirmed &&
+        response.providerFinishReason === 'completed' && response.message.partial !== true &&
+        response.rawFinishReason !== 'CONTINUATION' && !hasAnswerOrToolCall(response);
+      const googleThinkSnapshot = !silentPostDeliveryTurnEnd && isThinkOnlyCompletion(response) &&
+        this.llmRequester.supportsAssistantPrefill?.() === false;
       if (googleThinkSnapshot && continuationBudget.thinkingOnlyContinuations >= 1) {
         response = this.appendResponseContent(turnId, currentStep, stepUuid, response, streamParts);
         this.sealGoogleProtocolStep(turnId, currentStep, stepUuid, response, markStepStarted);
@@ -1669,7 +1675,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
       );
       this.finishStep(turnId, signal, currentStep, stepUuid, response, finishReason, markStepStarted);
       stepEndAppended = true;
-      if (thinkingOnlyFollowup && !hasAnswerOrToolCall(response)) {
+      if (!silentPostDeliveryTurnEnd && thinkingOnlyFollowup && !hasAnswerOrToolCall(response)) {
         throw thinkingOnlyContinuationExhausted(response);
       }
       const hookStopTurn = await this.runAfterStep(
@@ -1683,7 +1689,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
         hasCompletedModelResponse(response, finishReason),
         continuationBudget,
       );
-      if (!hookStopTurn && isThinkOnlyCompletion(response)) {
+      if (!silentPostDeliveryTurnEnd && !hookStopTurn && isThinkOnlyCompletion(response)) {
         if (this.llmRequester.supportsAssistantPrefill?.() === false) {
           throw googleThinkSnapshotExhausted(response);
         }
@@ -1694,6 +1700,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
         }
       }
       if (
+        !silentPostDeliveryTurnEnd &&
         !hookStopTurn &&
         continuationBudget.thinkingOnlyContinuations < 1 &&
         this.zeroOutputContinuationEnabled() &&
@@ -1799,7 +1806,6 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
   ): Promise<FinishReason> {
     const finishReason = response.providerFinishReason ?? 'completed';
     if (response.message.toolCalls.length === 0) return finishReason === 'tool_calls' ? 'other' : finishReason;
-    const eligibleForSendMessageStop = response.message.toolCalls.every(isSendMessageCompletionCompatibleTool);
     let pending: readonly ExecutionPendingTool[] = runtime.pendingStep?.tools ?? response.message.toolCalls.map(call => ({ call }));
     let stopTurn = runtime.pendingStep?.stopTurn ?? false;
     let forcedStopTurn = runtime.pendingStep?.forcedStopTurn ?? false;
@@ -1848,7 +1854,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
             toolCallId: batch.call.id, name: batch.call.name, args: batch.args, extras: batch.call.extras });
           this.context.appendLoopEvent({ type: 'tool.result', parentUuid: callUuid, toolCallId: batch.call.id,
             result: { isError: true, output: batch.output } });
-          if (isSendMessageCompletionCompatibleTool(batch.call)) sendMessageCompletionBlocked = true;
+          sendMessageCompletionBlocked = true;
           continue;
         }
         for await (const toolResult of this.toolExecutor.execute(batch.tools.map(tool => tool.call), {
@@ -1879,10 +1885,10 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
               sendMessageCompletionBlocked = true;
             } else {
               runtime.userDeliveryConfirmed = true;
-              if (result.stopTurn === true && eligibleForSendMessageStop) stopTurn = true;
+              if (result.stopTurn === true) stopTurn = true;
             }
           } else {
-            if (result.isError === true) sendMessageCompletionBlocked = true;
+            if (result.isError === true || result.allowsTurnEndWithSendMessage !== true) sendMessageCompletionBlocked = true;
             if (result.stopTurn === true) forcedStopTurn = true;
           }
         }
@@ -1891,7 +1897,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
     }
     signal.throwIfAborted();
     for (const reminder of systemReminders) this.appendExtensionReminder(reminder.text, reminder.variant);
-    if (eligibleForSendMessageStop && sendMessageCompletionBlocked) stopTurn = false;
+    if (sendMessageCompletionBlocked) stopTurn = false;
     return stopTurn || forcedStopTurn ? 'completed' : 'tool_calls';
   }
 
@@ -1995,6 +2001,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
     modelResponseCompleted?: boolean,
     runtime?: LoopRuntime,
   ): Promise<boolean> {
+    if (modelResponseCompleted && runtime !== undefined) runtime.thinkingOnlyContinuations = 0;
     const context: AfterStepContext = {
       ...stepIdentity,
       turnId,
@@ -2397,7 +2404,7 @@ function googleContinuationUnsupported(response: AgentLLMRequestFinish): ChatPro
 
 function googleThinkSnapshotExhausted(response: AgentLLMRequestFinish): ChatProviderError {
   return new ChatProviderError(
-    'Gemini returned no answer or tool call after the single thinking-only recovery allowed in this turn. The turn stopped with the thinking kept in history.',
+    'Gemini returned no answer or tool call after the single recovery allowed for consecutive thinking-only responses. The turn stopped with the thinking kept in history.',
     undefined,
     { details: {
       google_stop: 'think_snapshot_exhausted',
@@ -2444,14 +2451,10 @@ function isZeroOutputContentPart(part: ContentPart): boolean {
 
 const THINKING_ONLY_PROVIDER_ERROR_CODE = 'antigravity_thinking_only';
 const EMPTY_RESPONSE_PROVIDER_ERROR_CODE = 'antigravity_empty_response';
-const SEND_MESSAGE_COMPLETION_BOOKKEEPING_TOOLS = new Set(['TodoList']);
-
-function isSendMessageCompletionCompatibleTool(call: { readonly name: string }): boolean {
-  return call.name === 'SendMessage' || SEND_MESSAGE_COMPLETION_BOOKKEEPING_TOOLS.has(call.name);
-}
-
 function isSilentPostDeliveryTurnEnd(error: unknown): boolean {
-  if (readProviderEventErrorCode(error) === EMPTY_RESPONSE_PROVIDER_ERROR_CODE) return true;
+  if (readGenerateFailureFacts(error)?.message.partial === true) return false;
+  const code = readProviderEventErrorCode(error);
+  if (code === EMPTY_RESPONSE_PROVIDER_ERROR_CODE || code === THINKING_ONLY_PROVIDER_ERROR_CODE) return true;
   if (error instanceof APIEmptyResponseError) {
     return error.finishReason === 'completed' || error.finishReason === null || error.finishReason === undefined;
   }

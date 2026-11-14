@@ -826,6 +826,7 @@ export class SubagentTool implements ISubagentTool {
 
       if (runInBackground) {
         return {
+          allowsTurnEndWithSendMessage: true,
           output: this.withMainProfileNotice(handle, formatBackgroundAgentResult(taskId, handle, runLabel)),
         };
       }
@@ -862,7 +863,7 @@ export class SubagentTool implements ISubagentTool {
       const release = await abortable(this.tasks.waitForForegroundRelease(taskId), signal);
       if (release === 'detached' || release === 'timeout_detached') {
         const output = formatBackgroundAgentResult(taskId, handle, runLabel);
-        return { output: this.withMainProfileNotice(handle, steer?.aborted === true
+        return { allowsTurnEndWithSendMessage: true, output: this.withMainProfileNotice(handle, steer?.aborted === true
           ? `${output}\nNew input ended this foreground wait. Read the new input before deciding what to do next. The subagent has not been stopped; completion still arrives via automatic notification.`
           : output) };
       }

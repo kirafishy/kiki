@@ -627,9 +627,11 @@ confirm = false
 
 重试针对瞬时故障——连接错误、超时、HTTP 429 限流，以及符合重试条件的 HTTP 500–599 服务端错误。已有部分输出时通常会停止而不重放请求；对原生 Agent 轮次，产生输出后的连接中断可在 `[retry]` 的 `retry_partial_responses` 为 `true`（默认）时重试。已有输出后的 HTTP 429 或 500–599 失败、安全拒绝和额度耗尽仍会停止，不重放请求。
 
-当供应商确认模型正常结束，且只有非空思考、没有正文、工具调用或拒绝时，Kiki 会保留思考及原始签名，每轮最多显式发送一条 `Continue.` User 消息。网关的精确 `antigravity_thinking_only` 事件也可触发续接，但 Kiki 必须实际保留了思考，并确认没有其它输出、外部信息检索（grounding）或拒绝。取消、缺少终态事件、流中断、token 上限导致的停止均不符合条件。续接算一次真实模型请求，用量单独记录。第二次仍为空或请求失败时停止本轮；这次续接即使遇到 HTTP 429 或临时服务端错误，也不重试。
+当供应商确认模型正常结束，且只有非空思考、没有正文、工具调用或拒绝时，Kiki 会保留思考及原始签名，每个连续的 thinking-only 段最多显式发送一条 `Continue.` User 消息。某一步成功产出正文或工具调用后，这份预算归零。网关的精确 `antigravity_thinking_only` 事件也可触发续接，但 Kiki 必须实际保留了思考，并确认没有其它输出、外部信息检索（grounding）或拒绝。取消、缺少终态事件、流中断、token 上限导致的停止均不符合条件。续接算一次真实模型请求，用量单独记录。第二次仍为空或请求失败时停止本轮；这次续接即使遇到 HTTP 429 或临时服务端错误，也不重试。
 
-设置 `[loop_control] thinking_only_continuation = false` 可关闭这条自动消息，从下一个 step 边界起生效。拒绝尾部 Model 消息的 Google 模型仍保留原有的原始快照重试，它与显式续接共用每轮一次的恢复预算，不受该设置关闭。Google `CONTINUATION` 响应带有完整的 continuation token 时，由 provider 自己发送下一次请求；没有可用 token 时停止本轮，并保留已有部分响应。
+设置 `[loop_control] thinking_only_continuation = false` 可关闭这条自动消息，从下一个 step 边界起生效。拒绝尾部 Model 消息的 Google 模型仍保留原有的原始快照重试，它与显式续接共用每个连续段一次的恢复预算，不受该设置关闭。Google `CONTINUATION` 响应带有完整的 continuation token 时，由 provider 自己发送下一次请求；没有可用 token 时停止本轮，并保留已有部分响应。
+
+`SendMessage` 确认送达用户后，主 Agent 的工具结果续步若正常完成且只有思考或没有输出，可以静默结束本轮。Kiki 保留思考，不再发起恢复请求；符合条件的干净空响应或 thinking-only 供应商错误也会结束本轮。子 Agent、部分响应中断，以及没有可用 token 的 Google `CONTINUATION` 响应不适用这条规则。
 
 未配置或设为 `false` 时，`zero_output_continuation` 保持关闭。设为 `[loop_control] zero_output_continuation = true` 后，供应商确认正常结束，且思考文本、可见回答和工具调用都为空时，Kiki 会在同一轮发送一条 `Continue.` User 消息。附在空思考上的签名不是思考内容，并保留在对话里。非空的 redacted 思考数据算输出。非空思考文本仍走 `thinking_only_continuation`。子 Agent 使用同一规则；开关关闭时，没有内容的子任务完成仍失败，第二次仍为空也会停止本轮。token 用量不参与判断。该选择从下一个 step 边界起生效。这次续接是同一轮里的一次模型请求，不按连接错误或限流重试。取消、供应商错误，以及没有正常停止终态的流，仍走原有路径。
 

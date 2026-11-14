@@ -9,6 +9,7 @@ import { WarningIssued } from '#/agent/profile/profileOps';
 import { TurnStepRetrying } from '#/agent/stepRetry/stepRetryService';
 import { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
 import { IAgentUsageService } from '#/agent/usage/usage';
+import { ISessionDeliveryService } from '#/session/delivery/delivery';
 import type { ChatProvider } from '#/kosong/contract/provider';
 import { GoogleGenAIChatProvider } from '#/kosong/provider/bases/google-genai/google-genai';
 import { ProtocolAdapterRegistry } from '#/kosong/provider/protocolAdapterRegistry';
@@ -98,6 +99,30 @@ describe('google model-turn continuation', () => {
       expect(signaturesOf(generateContentStream.mock.calls[2]?.[0])).toContain(SIGNATURE);
       expect(contentsOf(generateContentStream.mock.calls[2]?.[0]).at(-1)?.['role']).toBe('user');
       expect(storedThink(local)).toEqual([{ type: 'think', think: THINKING, encrypted: SIGNATURE }]);
+    } finally {
+      await local.dispose();
+    }
+  });
+
+  it.each(['thinking', 'empty', 'CONTINUATION'] as const)('handles a Google %s STOP after confirmed SendMessage delivery without an empty snapshot retry', async (kind) => {
+    const generateContentStream = scriptedStream([
+      googlePartsChunk([{ functionCall: { name: 'SendMessage', args: { text: 'Already delivered.' } }, thoughtSignature: 'sig-send' }], 'STOP'),
+      kind === 'thinking' ? thinkChunk() : kind === 'CONTINUATION' ? continuationChunk() : googlePartsChunk([], 'STOP'),
+    ]);
+    const local = googleAgent('gemini-4-argon', generateContentStream, 'yolo');
+    const delivery = local.get(ISessionDeliveryService);
+    await delivery.ready;
+    await delivery.set('message');
+    const retries: TurnStepRetrying[] = [];
+    local.get(IEventBus).subscribe(TurnStepRetrying, event => retries.push(event));
+    try {
+      const terminal = await (await prompt(local)).completion;
+      expect(terminal.state).toBe(kind === 'CONTINUATION' ? 'failed' : 'completed');
+      expect(generateContentStream).toHaveBeenCalledTimes(2);
+      expect(retries).toEqual([]);
+      expect(promptCount(local, 'Continue.')).toBe(0);
+      if (kind === 'thinking') expect(storedThink(local)).toEqual([{ type: 'think', think: THINKING, encrypted: SIGNATURE }]);
+      await local.expectResumeMatches();
     } finally {
       await local.dispose();
     }
@@ -233,8 +258,8 @@ describe('google model-turn continuation', () => {
     }
   });
 
-  it('does not renew the snapshot budget after a tool step', async () => {
-    const generateContentStream = scriptedStream([thinkChunk(), toolChunk(), thinkChunk(), textChunk('too late')]);
+  it('renews the snapshot budget after a successful tool step', async () => {
+    const generateContentStream = scriptedStream([thinkChunk(), toolChunk(), thinkChunk(), textChunk('Recovered twice.')]);
     const local = googleAgent('gemini-4-argon', generateContentStream, 'yolo');
     let toolRuns = 0;
     local.get(IAgentToolRegistryService).register({
@@ -244,11 +269,12 @@ describe('google model-turn continuation', () => {
     local.get(IAgentProfileService).update({ activeToolNames: ['FinishWork'] });
     try {
       const terminal = await (await prompt(local)).completion;
-      expect(terminal.state).toBe('failed');
-      expect(generateContentStream).toHaveBeenCalledTimes(3);
+      expect(terminal).toMatchObject({ state: 'completed', result: { type: 'completed', steps: 2 } });
+      expect(generateContentStream).toHaveBeenCalledTimes(4);
       expect(toolRuns).toBe(1);
       expect(promptCount(local, 'Continue.')).toBe(0);
-      expect((await local.persistedWireRecords()).filter((record) => record.type === 'usage.record')).toHaveLength(3);
+      expect(contentsOf(generateContentStream.mock.calls[3]?.[0])).toEqual(contentsOf(generateContentStream.mock.calls[2]?.[0]));
+      expect((await local.persistedWireRecords()).filter((record) => record.type === 'usage.record')).toHaveLength(4);
       await local.expectResumeMatches();
     } finally {
       await local.dispose();
