@@ -37,6 +37,7 @@ import type {
   GenerateOptions,
   ResponseFormat,
   StreamedMessage,
+  ToolChoice,
 } from '#/kosong/contract/provider';
 import '#/kosong/provider/bases/anthropic/index';
 import {
@@ -150,6 +151,53 @@ async function captureRejectedFetch(run: () => Promise<unknown>): Promise<Reques
   if (captured === undefined) throw new Error('fetch was not called');
   return captured;
 }
+
+describe('explicit tool choice wire encoding', () => {
+  it.each(['anthropic', 'openai', 'openai_responses', 'google-genai'] as const)('encodes choices without changing the implicit first request on %s', async protocol => {
+    const choices: readonly (ToolChoice | undefined)[] = [undefined, 'auto', 'none', 'required', { type: 'function', name: 'Lookup' }];
+    for (const toolChoice of choices) {
+      const request = await captureRejectedFetch(async () => {
+        const options = { model: 'fixture-model', apiKey: 'YOUR_API_KEY', baseUrl: 'https://example.test/v1' };
+        const provider = protocol === 'anthropic' ? new AnthropicChatProvider(options)
+          : protocol === 'openai' ? new OpenAILegacyChatProvider(options)
+          : protocol === 'openai_responses' ? new OpenAIResponsesChatProvider(options) : new GoogleGenAIChatProvider(options);
+        return provider.generate('fixture system', [{ name: 'Lookup', description: 'Look up', parameters: { type: 'object', properties: {} } }], PROBE_HISTORY,
+          { toolChoice, thinking: toolChoice === 'auto' ? { effort: 'high' } : undefined });
+      });
+      const body = await request.json() as Record<string, unknown>;
+      if (protocol === 'google-genai') {
+        expect(body['toolConfig']).toEqual(toolChoice === undefined ? undefined : {
+          functionCallingConfig: typeof toolChoice === 'object'
+            ? { mode: 'ANY', allowedFunctionNames: ['Lookup'] }
+            : { mode: toolChoice === 'auto' ? 'AUTO' : toolChoice === 'none' ? 'NONE' : 'ANY' },
+        });
+      } else {
+        const expected = toolChoice === undefined ? undefined : protocol === 'anthropic'
+          ? typeof toolChoice === 'object' ? { type: 'tool', name: 'Lookup' } : { type: toolChoice === 'required' ? 'any' : toolChoice }
+          : protocol === 'openai' && typeof toolChoice === 'object' ? { type: 'function', function: { name: 'Lookup' } } : toolChoice;
+        expect(body['tool_choice']).toEqual(expected);
+        if (protocol === 'anthropic' && toolChoice === 'auto') expect(body['thinking']).toMatchObject({ type: 'adaptive' });
+      }
+    }
+  });
+
+  it('omits Anthropic tool_choice without tools even when auto is explicitly requested', async () => {
+    const request = await captureRejectedFetch(() => new AnthropicChatProvider({ model: 'fixture-model', apiKey: 'YOUR_API_KEY', baseUrl: 'https://example.test/v1' })
+      .generate('', [], PROBE_HISTORY, { toolChoice: 'auto', thinking: { effort: 'high' } }));
+    const body = await request.json() as Record<string, unknown>;
+    expect(body).not.toHaveProperty('tools');
+    expect(body).not.toHaveProperty('tool_choice');
+    expect(body['thinking']).toMatchObject({ type: 'adaptive' });
+  });
+
+  it('keeps explicit auto beside budget thinking on the Anthropic wire', async () => {
+    const request = await captureRejectedFetch(() => new AnthropicChatProvider({ model: 'fixture-model', apiKey: 'YOUR_API_KEY', baseUrl: 'https://example.test/v1', adaptiveThinking: false })
+      .generate('', [{ name: 'Lookup', description: 'Look up', parameters: {} }], PROBE_HISTORY, { toolChoice: 'auto', thinking: { effort: 'high' } }));
+    const body = await request.json() as Record<string, unknown>;
+    expect(body['tool_choice']).toEqual({ type: 'auto' });
+    expect(body['thinking']).toEqual({ type: 'enabled', budget_tokens: 32000 });
+  });
+});
 
 describe('native web tool provider schemas', () => {
   it.each(['anthropic', 'openai', 'openai_responses'] as const)('serializes an object-root schema with all donor fields through %s', async (protocol) => {

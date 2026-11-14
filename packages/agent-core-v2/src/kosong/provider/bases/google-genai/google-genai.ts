@@ -1091,6 +1091,12 @@ export class GoogleGenAIChatProvider implements ChatProvider {
       ...(tools.length > 0 ? { tools: tools.map((t) => toolToGoogleGenAI(t)) } : {}),
     };
     applyResponseFormat(config, options?.responseFormat);
+    if (tools.length > 0 && options?.toolChoice !== undefined) {
+      const choice = options.toolChoice;
+      config['toolConfig'] = { functionCallingConfig: typeof choice === 'object'
+        ? { mode: 'ANY', allowedFunctionNames: [choice.name] }
+        : { mode: choice === 'auto' ? 'AUTO' : choice === 'none' ? 'NONE' : 'ANY' } };
+    }
 
     const streamController = this._stream ? new AbortController() : undefined;
     try {

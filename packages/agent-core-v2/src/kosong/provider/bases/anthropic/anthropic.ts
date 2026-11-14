@@ -1197,6 +1197,12 @@ export class AnthropicChatProvider implements ChatProvider {
 
     if (anthropicTools.length > 0) {
       createParams['tools'] = anthropicTools;
+      const choice = options?.toolChoice;
+      if (choice !== undefined) {
+        createParams['tool_choice'] = typeof choice === 'object'
+          ? { type: 'tool', name: choice.name }
+          : { type: choice === 'required' ? 'any' : choice };
+      }
     }
 
     if (metadata !== undefined) {

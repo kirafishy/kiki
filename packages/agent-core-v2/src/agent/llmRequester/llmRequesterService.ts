@@ -901,6 +901,10 @@ export class AgentLLMRequesterService extends Disposable implements IAgentLLMReq
             });
             throw error;
           }
+          if (malformedFunctionCall && params.toolChoice === undefined && request.tools.length > 0 &&
+            params.requestParams?.['tool_choice'] === undefined && request.model.requestParams?.['tool_choice'] === undefined) {
+            params = { ...params, toolChoice: 'auto' };
+          }
           if (request.model.protocol === 'google-genai') {
             params = { ...params, googleContinuationToken: discardRetry ? undefined : readGenerateContinuationToken(error) };
           }
@@ -1270,6 +1274,7 @@ export class AgentLLMRequesterService extends Disposable implements IAgentLLMReq
     const params: ModelRequestParams = {
       ...baseParams,
       thinkingEffort: overrides.thinkingEffort ?? baseParams.thinkingEffort,
+      toolChoice: overrides.toolChoice ?? baseParams.toolChoice,
       cacheKey: identityProjection.cacheKey,
       requestParams: withIdentityParams(
         stripRequestIdentityBodyParams(stripKikiReservedRequestParams(baseParams.requestParams)),

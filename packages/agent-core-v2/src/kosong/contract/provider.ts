@@ -9,6 +9,8 @@ export type ThinkingEffort = 'off' | 'on' | (string & {});
 
 export type ServiceTier = 'auto' | 'default' | 'flex' | 'priority';
 
+export type ToolChoice = 'auto' | 'none' | 'required' | { readonly type: 'function'; readonly name: string };
+
 export type RequestParamValue = string | number | boolean;
 export type RequestParams = Readonly<Record<string, RequestParamValue>>;
 
@@ -117,6 +119,7 @@ export interface GenerateOptions {
   signal?: AbortSignal;
   auth?: ProviderRequestAuth;
   responseFormat?: ResponseFormat;
+  toolChoice?: ToolChoice;
   cacheKey?: string;
   googleContinuationToken?: string;
   serviceTier?: ServiceTier;
@@ -139,7 +142,7 @@ export interface GenerateOptions {
 /** The L0 `ChatProvider` wire contract (the file is named `provider`, but this is the contract, not an
  *  implementation). Two invariants: a provider is immutable after construction — there are no `with*`
  *  methods, so every per-turn intent (prompt-cache key, service tier, additional request params,
- *  sampling overrides, thinking effort/keep, completion-token budget) flows through `GenerateOptions`
+ *  tool choice, sampling overrides, thinking effort/keep, completion-token budget) flows through `GenerateOptions`
  *  on each `generate` call; and `GenerateOptions` is the per-turn intent carrier, whose encoding each
  *  wire dialect decides (a cache key may become `prompt_cache_key`, `metadata.user_id`, or be silently
  *  dropped), while request headers stay on the transport options rather than the body. */

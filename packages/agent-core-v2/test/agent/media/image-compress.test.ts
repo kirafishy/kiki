@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { deflateSync } from 'node:zlib';
 
 import { Jimp, ResizeStrategy } from 'jimp';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -22,13 +23,14 @@ import {
   validateImageDataUrl,
 } from '#/agent/media/image-compress';
 import { sniffImageDimensions } from '#/agent/media/file-type';
-import { decodeImageVerdict } from '#/agent/media/imageDecode';
+import { decodeImageVerdict, decodeToJimp } from '#/agent/media/imageDecode';
 import * as cpuRuntime from '#/app/cpuWorker/runtime';
 import {
   normalizeImageMime,
   unsupportedImageMimeFromUrl,
 } from '#/agent/media/image-format-policy';
 import { buildDaemonFileUrl } from '#/agent/media/mediaRef';
+import { pngChunk, withPngChunk } from './pngFixtures';
 
 const PARALLEL_WORKER_CONTENTION_TIMEOUT_MS = 30_000;
 
@@ -163,6 +165,150 @@ function withExifOrientation(jpeg: Uint8Array, orientation: number): Uint8Array 
     ]),
   );
 }
+
+describe('PNG ancillary recovery', () => {
+  it.each(['bad-crc', 'short-gamma'] as const)('decodes and validates pixel data after removing %s metadata', async mode => {
+    const source = Buffer.from(await translucentPng(7, 5));
+    const png = withPngChunk(source, 'gAMA', mode === 'bad-crc' ? Buffer.from([0, 0, 177, 143]) : Buffer.from([1]), mode === 'bad-crc');
+    await expect(Jimp.fromBuffer(png)).rejects.toThrow();
+    const image = await decodeToJimp(png, 'image/png');
+    expect([image.width, image.height]).toEqual([7, 5]);
+    expect(image.bitmap.data).toEqual((await Jimp.fromBuffer(source)).bitmap.data);
+    expect(await decodeImageVerdict(png, 'image/png')).toBe(true);
+    try {
+      const validated = await validateImageDataUrl(`data:image/png;base64,${png.toString('base64')}`);
+      expect(validated?.bytes).toEqual(png);
+    } finally { await cpuRuntime.closeCpuPool(); }
+  }, PARALLEL_WORKER_CONTENTION_TIMEOUT_MS);
+
+  it('compresses a recovered PNG instead of silently passing the original through', async () => {
+    const png = withPngChunk(await translucentPng(120, 60), 'gAMA', Buffer.from([1]));
+    const result = await compressImageForModel(png, 'image/png', { maxEdge: 40 });
+    expect(result).toMatchObject({ changed: true, width: 40, height: 20, originalWidth: 120, originalHeight: 60, mimeType: 'image/png' });
+    const image = await Jimp.fromBuffer(Buffer.from(result.data));
+    expect(image.getPixelColor(20, 10)).toBe(0x3366cc80);
+  });
+
+  it('preserves palette transparency when removing ancillary metadata', async () => {
+    const header = Buffer.alloc(13);
+    header.writeUInt32BE(2, 0);
+    header.writeUInt32BE(1, 4);
+    header[8] = 8;
+    header[9] = 3;
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      pngChunk('IHDR', header),
+      pngChunk('PLTE', Buffer.from([255, 0, 0, 0, 0, 255])),
+      pngChunk('tRNS', Buffer.from([0, 128])),
+      pngChunk('gAMA', Buffer.from([1])),
+      pngChunk('IDAT', deflateSync(Buffer.from([0, 0, 1]))),
+      pngChunk('IEND', Buffer.alloc(0)),
+    ]);
+    const image = await decodeToJimp(png, 'image/png');
+    expect([image.width, image.height]).toEqual([2, 1]);
+    expect(image.getPixelColor(0, 0) & 0xff).toBe(0);
+    expect(image.getPixelColor(1, 0)).toBe(0x0000ff80);
+  });
+
+  it.each(['sRGB', 'pHYs'] as const)('accepts %s chunks without recovery when pngjs ignores their metadata', async type => {
+    const png = withPngChunk(await solidPng(7, 5), type, type === 'sRGB' ? Buffer.from([255]) : Buffer.alloc(9), true);
+    expect((await Jimp.fromBuffer(png)).width).toBe(7);
+    expect(await decodeImageVerdict(png, 'image/png')).toBe(true);
+  });
+
+  it('decodes legal 16-bit RGBA data without stripping pixel information', async () => {
+    const header = Buffer.alloc(13);
+    header.writeUInt32BE(1, 0);
+    header.writeUInt32BE(1, 4);
+    header[8] = 16;
+    header[9] = 6;
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      pngChunk('IHDR', header),
+      pngChunk('IDAT', deflateSync(Buffer.from([0, 255, 255, 0, 0, 0, 0, 255, 255]))),
+      pngChunk('IEND', Buffer.alloc(0)),
+    ]);
+    expect((await decodeToJimp(png, 'image/png')).getPixelColor(0, 0)).toBe(0xff0000ff);
+  });
+
+  it.each(['complete', 'short-pixels', 'extra-pixels'] as const)('checks the exact Adam7 pixel stream during recovery: %s', async mode => {
+    const header = Buffer.alloc(13);
+    header.writeUInt32BE(9, 0);
+    header.writeUInt32BE(5, 4);
+    header[8] = 8;
+    header[9] = 6;
+    header[12] = 1;
+    const scanlines: Buffer[] = [];
+    for (const [width, height] of [[2, 1], [1, 1], [3, 1], [2, 2], [5, 1], [4, 3], [9, 2]] as const) {
+      const row = Buffer.from([0, ...Array.from({ length: width }, () => [51, 102, 204, 128]).flat()]);
+      for (let y = 0; y < height; y++) scanlines.push(row);
+    }
+    const pixels = Buffer.concat(scanlines);
+    expect(pixels.length).toBe(191);
+    const payload = mode === 'short-pixels' ? pixels.subarray(0, -1)
+      : mode === 'extra-pixels' ? Buffer.concat([pixels, Buffer.from([0])]) : pixels;
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      pngChunk('IHDR', header), pngChunk('gAMA', Buffer.from([1])),
+      pngChunk('IDAT', deflateSync(payload)), pngChunk('IEND', Buffer.alloc(0)),
+    ]);
+    expect(await decodeImageVerdict(png, 'image/png')).toBe(mode === 'complete');
+    if (mode === 'complete') {
+      const image = await decodeToJimp(png, 'image/png');
+      expect([image.width, image.height]).toEqual([9, 5]);
+      expect(image.getPixelColor(8, 4)).toBe(0x3366cc80);
+    }
+  });
+
+  it.each(['short-pixels', 'extra-pixels'] as const)('rejects CRC-correct zlib data with %s in a non-interlaced image', async mode => {
+    const header = Buffer.alloc(13);
+    header.writeUInt32BE(1, 0);
+    header.writeUInt32BE(1, 4);
+    header[8] = 8;
+    header[9] = 6;
+    const pixels = mode === 'short-pixels' ? [0, 255, 0, 0] : [0, 255, 0, 0, 255, 0];
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      pngChunk('IHDR', header), pngChunk('gAMA', Buffer.from([1])),
+      pngChunk('IDAT', deflateSync(Buffer.from(pixels))), pngChunk('IEND', Buffer.alloc(0)),
+    ]);
+    expect(await decodeImageVerdict(png, 'image/png')).toBe(false);
+  });
+
+  it.each(['missing-iend', 'short-iend', 'bad-idat-crc', 'bad-deflate', 'bad-ihdr-crc', 'zero-width', 'invalid-header', 'missing-idat', 'truncated-chunk', 'unknown-critical'] as const)('keeps rejecting %s even alongside recoverable metadata', async mode => {
+    const source = Buffer.from(await solidPng(9, 6));
+    let png: Buffer = withPngChunk(source, 'gAMA', Buffer.from([1]));
+    if (mode === 'missing-iend') png = png.subarray(0, -12);
+    else if (mode === 'short-iend') png = png.subarray(0, -1);
+    else if (mode === 'bad-idat-crc') png.writeUInt8(png.at(-13)! ^ 1, png.length - 13);
+    else if (mode === 'bad-deflate') {
+      const start = png.indexOf('IDAT');
+      const length = png.readUInt32BE(start - 4);
+      png = Buffer.concat([png.subarray(0, start - 4), pngChunk('IDAT', Buffer.alloc(length)), png.subarray(start + length + 8)]);
+    } else if (mode === 'bad-ihdr-crc') png[32]! ^= 1;
+    else if (mode === 'zero-width' || mode === 'invalid-header') {
+      const header = Buffer.from(source.subarray(16, 29));
+      if (mode === 'zero-width') header.writeUInt32BE(0, 0);
+      else header[8] = 3;
+      png = Buffer.concat([png.subarray(0, 8), pngChunk('IHDR', header), png.subarray(33)]);
+    } else if (mode === 'missing-idat') png = Buffer.concat([png.subarray(0, 46), png.subarray(-12)]);
+    else if (mode === 'truncated-chunk') png.writeUInt32BE(png.length, 33);
+    else if (mode === 'unknown-critical') png = withPngChunk(png, 'ABCD', Buffer.from([1]));
+    expect(await decodeImageVerdict(png, 'image/png')).toBe(false);
+    try {
+      expect(await validateImageDataUrl(`data:image/png;base64,${png.toString('base64')}`)).toBeNull();
+    } finally { await cpuRuntime.closeCpuPool(); }
+  }, PARALLEL_WORKER_CONTENTION_TIMEOUT_MS);
+
+  it('rejects truncated base64 before scheduling image decoding', async () => {
+    const png = await solidPng(7, 5);
+    const decode = vi.spyOn(cpuRuntime, 'runCpuTask');
+    try {
+      expect(await validateImageDataUrl(`data:image/png;base64,${Buffer.from(png).toString('base64').slice(0, 9)}`)).toBeNull();
+      expect(decode).not.toHaveBeenCalled();
+    } finally { decode.mockRestore(); }
+  });
+});
 
 describe('compressImageForModel — fast path', () => {
   it('passes a within-budget image through untouched (same reference)', async () => {

@@ -2058,6 +2058,47 @@ describe('AgentLLMRequesterService interrupted response retry', () => {
     expect(onAttemptRetry).not.toHaveBeenCalled();
   });
 
+  it.each(['default', 'none', 'function', 'no-tools', 'interruption', 'missing-terminal', 'native-request', 'native-model'] as const)('sets retry tool choice only for an implicit malformed call with tools: %s', async mode => {
+    const attempts: ModelRequestParams[] = [];
+    const calls = { value: 0 };
+    const error = mode === 'interruption' ? new APIConnectionError('socket closed')
+      : markProviderEventError(new ChatProviderError('fixture failure'), mode === 'missing-terminal'
+        ? 'antigravity_missing_terminal' : 'antigravity_malformed_function_call');
+    const base = createRequester(calls, error, [], undefined, {
+      requestParams: mode === 'native-model' ? { tool_choice: 'required' } : undefined,
+    });
+    const requester: ModelRequester = { ...base, request: async function* (input, signal, params) {
+      attempts.push(params);
+      yield* base.request(input, signal, params);
+    } };
+    const toolChoice = mode === 'none' ? 'none' : mode === 'function' ? { type: 'function' as const, name: 'Lookup' } : undefined;
+    const { service } = createService(requester, undefined, {
+      requestParams: { toolChoice, requestParams: mode === 'native-request' ? { tool_choice: 'required' } : undefined },
+      retryConfig: { policies: [{ match: '.*', retry: true, backoff: 1 }] },
+    });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 }, onAttemptRetry: () => {},
+      tools: mode === 'no-tools' ? [] : [{ name: 'Lookup', description: 'Look up', parameters: {} }] });
+    expect(attempts).toHaveLength(2);
+    expect(attempts[0]?.toolChoice).toEqual(toolChoice);
+    expect(attempts[1]?.toolChoice).toEqual(mode === 'default' ? 'auto' : toolChoice);
+  });
+
+  it('honors an explicit per-request choice over the configured choice during retry', async () => {
+    const attempts: ModelRequestParams[] = [];
+    const base = createRequester({ value: 0 }, markProviderEventError(new ChatProviderError('malformed'), 'antigravity_malformed_function_call'));
+    const requester: ModelRequester = { ...base, request: async function* (input, signal, params) {
+      attempts.push(params);
+      yield* base.request(input, signal, params);
+    } };
+    const { service } = createService(requester, undefined, {
+      requestParams: { toolChoice: 'required' },
+      retryConfig: { policies: [{ match: '.*', retry: true, backoff: 1 }] },
+    });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 }, onAttemptRetry: () => {},
+      toolChoice: 'none', tools: [{ name: 'Lookup', description: 'Look up', parameters: {} }] });
+    expect(attempts.map(attempt => attempt.toolChoice)).toEqual(['none', 'none']);
+  });
+
   it.each(['local', 'executed', 'policy', 'never', 'operation', 'no-retraction'] as const)('honors %s for a malformed function-call failure', async (mode) => {
     const error = markProviderEventError(new ChatProviderError('malformed function call'), 'antigravity_malformed_function_call');
     attachErrorDetails(error, { upstream_retryable: false });
@@ -3119,11 +3160,13 @@ describe.each(['anthropic', 'google-genai'] as const)('%s malformed function-cal
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
     const model = { ...createRequester({ value: 0 }, null).model, protocol, baseUrl,
+      capabilities: { ...capabilities, thinking: true, tool_use: true, max_context_tokens: 128000 },
       authProvider: { getAuth: async () => ({ apiKey: 'YOUR_API_KEY' }) } };
-    const options = { model: model.name, baseUrl, apiKey: 'YOUR_API_KEY' };
+    const options = { model: model.name, baseUrl, apiKey: 'YOUR_API_KEY', adaptiveThinking: false };
     const provider = protocol === 'google-genai' ? new GoogleGenAIChatProvider(options) : new AnthropicChatProvider(options);
     const requester = new ModelRequesterImpl(model, { createChatProvider: () => provider } as unknown as IProtocolAdapterRegistry);
     const { service, events } = createService(requester, undefined, {
+      requestParams: { thinkingEffort: 'high' },
       env: { [KIKI_INFINITE_RETRY_ENV]: '1' }, retryConfig: { maxAttempts: 5, policies: [{ match: '.*', retry: true, backoff: 1 }] },
     });
     const visible: StreamedMessagePart[] = [];
@@ -3133,6 +3176,7 @@ describe.each(['anthropic', 'google-genai'] as const)('%s malformed function-cal
     });
     try {
       const pending = service.request({ source: { type: 'turn', turnId: 1, step: 1 }, onAttemptRetry,
+        tools: [{ name: 'SaveWork', description: 'Save work', parameters: { type: 'object', properties: {} } }],
         retry: mode === 'never' ? 'never' : undefined }, part => { visible.push(part); }, AbortSignal.timeout(3500));
       if (mode === 'recover' || mode === 'tool') {
         expect((await pending).message).toMatchObject({ content: [{ type: 'text', text: 'recovered' }], toolCalls: [] });
@@ -3146,7 +3190,18 @@ describe.each(['anthropic', 'google-genai'] as const)('%s malformed function-cal
       }
       const expectedAttempts = mode === 'recover' || mode === 'tool' ? 2 : mode === 'exhaust' ? 3 : 1;
       expect(bodies).toHaveLength(expectedAttempts);
-      expect(new Set(bodies).size).toBe(1);
+      const parsed = bodies.map(body => JSON.parse(body) as Record<string, unknown>);
+      for (const [index, body] of parsed.entries()) {
+        if (protocol === 'anthropic') {
+          expect(body['tool_choice']).toEqual(index === 0 ? undefined : { type: 'auto' });
+          expect(body['thinking']).toMatchObject({ type: 'enabled', budget_tokens: 32000 });
+          delete body['tool_choice'];
+        } else {
+          expect(body['toolConfig']).toEqual(index === 0 ? undefined : { functionCallingConfig: { mode: 'AUTO' } });
+          delete body['toolConfig'];
+        }
+        expect(body).toEqual(parsed[0]);
+      }
       expect(onAttemptRetry.mock.calls).toEqual(Array.from({ length: expectedAttempts - 1 }, () => ['discard']));
       expect(events.filter(event => event.type === 'turn.step.retrying')).toHaveLength(expectedAttempts - 1);
     } finally {

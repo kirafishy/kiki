@@ -1585,6 +1585,9 @@ export class OpenAIResponsesChatProvider implements ChatProvider {
         stream: this._stream,
         ...kwargs,
       };
+      if (tools.length > 0 && options?.toolChoice !== undefined) {
+        createParams['tool_choice'] = options.toolChoice;
+      }
       if (systemPrompt) {
         createParams['instructions'] = systemPrompt;
       }

@@ -646,6 +646,12 @@ export class OpenAILegacyChatProvider implements ChatProvider {
     if (tools.length > 0) {
       const convertTool = this._hooks?.convertTool ?? ((tool: Tool) => toolToOpenAI(tool));
       createParams['tools'] = tools.map((tool) => convertTool(tool));
+      const choice = options?.toolChoice;
+      if (choice !== undefined) {
+        createParams['tool_choice'] = typeof choice === 'object'
+          ? { type: 'function', function: { name: choice.name } }
+          : choice;
+      }
     }
     if (options?.responseFormat !== undefined) {
       createParams['response_format'] = responseFormatToOpenAI(options.responseFormat);
