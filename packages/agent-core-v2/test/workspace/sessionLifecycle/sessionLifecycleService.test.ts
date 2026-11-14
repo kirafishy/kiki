@@ -1559,7 +1559,7 @@ describe('SessionLifecycleService subagent promotion', () => {
 
   function promotionFixture(meta: Record<string, AgentMeta>, sessionScope = 'workspace-1/session-1') {
     const fx = fixture();
-    const sourceRecords = [
+    const sourceRecords: Array<Record<string, unknown>> = [
       { type: 'metadata', protocol_version: '1.5', created_at: 1 },
       { type: 'profile.bind', profile: 'coder', time: 2 },
       { type: 'executor.session.updated', sessionRef: { ref: { sessionId: 'remote-1' } }, time: 3 },
@@ -1587,6 +1587,7 @@ describe('SessionLifecycleService subagent promotion', () => {
     });
     const rewrite = vi.fn();
     const createAgent = vi.fn(async () => {});
+    const registerAgent = vi.fn(async () => {});
     const update = vi.fn(async () => {});
     const writes: Array<{ scope: string; key: string }> = [];
     const target = {
@@ -1594,7 +1595,7 @@ describe('SessionLifecycleService subagent promotion', () => {
       dispose: vi.fn(),
       accessor: accessor([
         [ISessionContext, { sessionId: 'promoted' }],
-        [ISessionMetadata, { drain: async () => {}, update }],
+        [ISessionMetadata, { drain: async () => {}, registerAgent, update }],
         [IAgentLifecycleService, { list: () => [], create: createAgent }],
         [ISessionAgentProfileCatalog, {
           ready: Promise.resolve(),
@@ -1641,7 +1642,7 @@ describe('SessionLifecycleService subagent promotion', () => {
       },
       models: { ready: Promise.resolve(), resolveId: (id: string) => id },
     });
-    return { fx, sourceRecords, snapshot, read, readScopes, rewrite, createAgent, update, writes, materialize, announce };
+    return { fx, sourceRecords, snapshot, read, readScopes, rewrite, createAgent, registerAgent, update, writes, materialize, announce };
   }
 
   it('copies a subagent into a new main-agent thread without touching the source', async () => {
@@ -1663,7 +1664,13 @@ describe('SessionLifecycleService subagent promotion', () => {
       expect(text).toContain(`blobref:main:${parentHash}`);
       expect(text).not.toContain('blobref:agent-3');
       expect(text).not.toContain('remote-1');
-      expect(copied.map((record) => record['type'])).not.toContain('subagent.spawned');
+      expect(copied.map((record) => record['type'])).toContain('subagent.spawned');
+      expect(copied).toContainEqual({
+        type: 'subagent.failed',
+        subagentId: 'agent-9',
+        error: 'terminated',
+        time: 8,
+      });
       expect(copied.map((record) => record['type'])).not.toContain('profile.bind');
       expect(copied.filter((record) => record['type'] === 'tools.update_store').map((record) => record['key'])).toEqual(['todo', 'todo_notes']);
       expect(copied.at(-1)?.['type']).toBe('forked');
@@ -1682,6 +1689,242 @@ describe('SessionLifecycleService subagent promotion', () => {
         promotedFrom: expect.objectContaining({ sessionId: 'session-1', agentId: 'agent-3', agentName: 'Researcher', profile: 'coder' }),
       }));
       expect(p.announce).toHaveBeenCalledOnce();
+    } finally {
+      p.materialize.mockRestore();
+      p.announce.mockRestore();
+      await p.fx.service.dispose();
+    }
+  });
+
+  it('copies child, grandchild, and branch subtrees with reparented metadata and settled in-flight state', async () => {
+    const childHash = 'e'.repeat(64);
+    const grandchildHash = 'f'.repeat(64);
+    const p = promotionFixture({
+      main: { type: 'main' },
+      'agent-3': agentMeta,
+      'agent-sibling': {
+        type: 'sub',
+        delegator: { kind: 'agent', agentId: 'main' },
+        labels: { parentAgentId: 'main', profileName: 'worker' },
+        status: 'completed',
+      },
+      'agent-child': {
+        type: 'sub',
+        homedir: '/home/workspace-1/session-1/agents/agent-child',
+        delegator: { kind: 'agent', agentId: 'agent-3' },
+        userLabel: 'Worker child',
+        model: 'model-b',
+        status: 'completed',
+        completedAt: 12,
+        resultSummary: 'Child finished.',
+        labels: { parentAgentId: 'agent-3', profileName: 'worker' },
+      },
+      'agent-grandchild': {
+        type: 'sub',
+        homedir: '/home/workspace-1/session-1/agents/agent-grandchild',
+        delegator: { kind: 'agent', agentId: 'agent-child' },
+        userLabel: 'Explore grandchild',
+        model: 'model-c',
+        status: 'completed',
+        completedAt: 11,
+        resultSummary: 'Found files.',
+        labels: { parentAgentId: 'agent-child', profileName: 'explore', requestIdentityRootAgent: 'agent-3' },
+      },
+      'agent-branch': {
+        type: 'sub',
+        homedir: '/home/workspace-1/session-1/agents/agent-branch',
+        delegator: { kind: 'agent', agentId: 'agent-3' },
+        forkedFrom: 'agent-3',
+        labels: { parentAgentId: 'agent-3', branch: 'true', branchSeed: 'verbatim', branchSealed: 'true' },
+        status: 'completed',
+        completedAt: 13,
+      },
+      'agent-running': {
+        type: 'sub',
+        homedir: '/home/workspace-1/session-1/agents/agent-running',
+        delegator: { kind: 'agent', agentId: 'agent-3' },
+        labels: { parentAgentId: 'agent-3', profileName: 'worker' },
+      },
+    });
+    const wiresByScope: Record<string, Array<Record<string, unknown>>> = {
+      'workspace-1/session-1/agents/agent-3': [
+        { type: 'metadata', protocol_version: '1.5', created_at: 1 },
+        {
+          type: 'subagent.spawned',
+          subagentId: 'agent-child',
+          taskId: 'subagent-child-11111111',
+          parentAgentId: 'agent-3',
+          callerAgentId: 'agent-3',
+          parentToolCallId: 'tc-1',
+          runInBackground: false,
+          time: 9,
+        },
+        {
+          type: 'subagent.completed',
+          subagentId: 'agent-child',
+          taskId: 'subagent-child-11111111',
+          resultSummary: 'Child finished.',
+          time: 12,
+        },
+        {
+          type: 'subagent.spawned',
+          subagentId: 'agent-running',
+          taskId: 'subagent-open-22222222',
+          parentAgentId: 'agent-3',
+          callerAgentId: 'agent-3',
+          parentToolCallId: 'tc-2',
+          runInBackground: true,
+          time: 14,
+        },
+        { type: 'turn.ended', turnId: 0, reason: 'completed', time: 15 },
+      ],
+      'workspace-1/session-1/agents/agent-child': [
+        { type: 'metadata', protocol_version: '1.5', created_at: 9 },
+        { type: 'profile.bind', profile: 'worker', time: 9 },
+        {
+          type: 'context.append_message',
+          time: 10,
+          message: {
+            id: 'c1',
+            role: 'user',
+            content: [
+              { type: 'image_url', imageUrl: { url: `blobref:agent-3:${hash}` } },
+              { type: 'image_url', imageUrl: { url: `blobref:agent-child:${childHash}` } },
+              { type: 'image_url', imageUrl: { url: `blobref:main:${parentHash}` } },
+            ],
+            toolCalls: [],
+          },
+        },
+        {
+          type: 'usage.record',
+          model: 'model-b',
+          agentId: 'agent-child',
+          parentAgentId: 'agent-3',
+          usage: { inputOther: 10, output: 5, inputCacheRead: 0, inputCacheCreation: 0 },
+          time: 11,
+        },
+        { type: 'turn.ended', turnId: 0, reason: 'completed', time: 12 },
+      ],
+      'workspace-1/session-1/agents/agent-grandchild': [
+        { type: 'metadata', protocol_version: '1.5', created_at: 10 },
+        {
+          type: 'context.append_message',
+          time: 10,
+          message: {
+            id: 'gc1',
+            role: 'user',
+            content: [{ type: 'image_url', imageUrl: { url: `blobref:agent-grandchild:${grandchildHash}` } }],
+            toolCalls: [],
+          },
+        },
+        { type: 'turn.ended', turnId: 0, reason: 'completed', time: 11 },
+      ],
+      'workspace-1/session-1/agents/agent-branch': [
+        { type: 'metadata', protocol_version: '1.5', created_at: 12 },
+        { type: 'branch.base', version: 1, parentAgentId: 'agent-3', seed: 'verbatim', inheritedCount: 1, time: 12 },
+        { type: 'agent.branch_sealed', sealed: true, time: 13 },
+      ],
+      'workspace-1/session-1/agents/agent-running': [
+        { type: 'metadata', protocol_version: '1.5', created_at: 14 },
+        { type: 'turn.prompt', turnId: 0, input: [{ type: 'text', text: 'still running' }], origin: { kind: 'user' }, time: 14 },
+        {
+          type: 'context.append_loop_event',
+          time: 15,
+          event: { type: 'step.begin', uuid: 's-open', turnId: '0', step: 1 },
+        },
+      ],
+    };
+    p.read.mockImplementation(async function* (scope: string) {
+      p.readScopes.push(scope);
+      yield* (wiresByScope[scope] ?? []);
+    });
+    try {
+      const source = await p.fx.service.readPromotionSource({ sourceSessionId: 'session-1', agentId: 'agent-3' });
+      expect(source.descendants?.map((item) => ({ id: item.agentId, parent: item.parentAgentId }))).toEqual([
+        { id: 'agent-child', parent: 'main' },
+        { id: 'agent-branch', parent: 'main' },
+        { id: 'agent-running', parent: 'main' },
+        { id: 'agent-grandchild', parent: 'agent-child' },
+      ]);
+      await p.fx.service.materializePromotion(source, {
+        sourceSessionId: 'session-1',
+        agentId: 'agent-3',
+        newSessionId: 'promoted',
+      });
+      const writtenByScope = new Map(
+        p.rewrite.mock.calls.map(([scope, , records]) => [scope as string, records as Array<Record<string, unknown>>]),
+      );
+      expect([...writtenByScope.keys()]).toEqual([
+        'workspace-1/promoted/agents/main',
+        'workspace-1/promoted/agents/agent-child',
+        'workspace-1/promoted/agents/agent-branch',
+        'workspace-1/promoted/agents/agent-running',
+        'workspace-1/promoted/agents/agent-grandchild',
+      ]);
+      const mainWritten = writtenByScope.get('workspace-1/promoted/agents/main')!;
+      expect(mainWritten).toContainEqual(expect.objectContaining({
+        type: 'subagent.spawned',
+        subagentId: 'agent-child',
+        parentAgentId: 'main',
+        callerAgentId: 'main',
+      }));
+      expect(mainWritten).toContainEqual({
+        type: 'subagent.failed',
+        subagentId: 'agent-running',
+        taskId: 'subagent-open-22222222',
+        error: 'terminated',
+        time: 15,
+      });
+
+      const childWrittenText = JSON.stringify(writtenByScope.get('workspace-1/promoted/agents/agent-child'));
+      expect(childWrittenText).toContain(`blobref:main:${hash}`);
+      expect(childWrittenText).toContain(`blobref:agent-child:${childHash}`);
+      expect(childWrittenText).toContain(`blobref:agent-child:${parentHash}`);
+      expect(p.writes).toContainEqual({ scope: 'workspace-1/promoted/agents/agent-child/blobs', key: parentHash });
+
+      const runningWritten = writtenByScope.get('workspace-1/promoted/agents/agent-running')!;
+      expect(runningWritten).toContainEqual(expect.objectContaining({
+        type: 'turn.ended',
+        turnId: 0,
+        reason: 'cancelled',
+      }));
+
+      const registered = new Map(
+        p.registerAgent.mock.calls.map((call) => {
+          const [id, meta] = call as unknown as [string, AgentMeta];
+          return [id, meta] as const;
+        }),
+      );
+      expect(registered.get('agent-child')).toMatchObject({
+        parentAgentId: 'main',
+        delegator: { kind: 'agent', agentId: 'main' },
+        status: 'completed',
+        resultSummary: 'Child finished.',
+      });
+      expect(registered.get('agent-grandchild')).toMatchObject({
+        parentAgentId: 'agent-child',
+        delegator: { kind: 'agent', agentId: 'agent-child' },
+        status: 'completed',
+        labels: expect.objectContaining({ parentAgentId: 'agent-child', requestIdentityRootAgent: 'main' }),
+      });
+      expect(registered.get('agent-branch')).toMatchObject({
+        parentAgentId: 'main',
+        forkedFrom: 'main',
+        status: 'completed',
+        labels: expect.objectContaining({ branch: 'true', branchSealed: 'true', parentAgentId: 'main' }),
+      });
+      expect(registered.get('agent-running')).toMatchObject({
+        parentAgentId: 'main',
+        delegator: { kind: 'agent', agentId: 'main' },
+        status: 'cancelled',
+      });
+      expect(p.update).toHaveBeenCalledWith(expect.objectContaining({
+        usage: {
+          total: { inputOther: 10, output: 5, inputCacheRead: 0, inputCacheCreation: 0 },
+          byModel: { 'model-b': { inputOther: 10, output: 5, inputCacheRead: 0, inputCacheCreation: 0 } },
+          wireComplete: true,
+        },
+      }));
     } finally {
       p.materialize.mockRestore();
       p.announce.mockRestore();

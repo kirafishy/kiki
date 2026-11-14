@@ -793,6 +793,98 @@ describe('SessionController pipeline', () => {
     expect(controller.getState().loadError).toBeUndefined();
   });
 
+  it('resyncs again after a suspended snapshot aborts', async () => {
+    let signal: AbortSignal | undefined;
+    let readCount = 0;
+    const reads = vi.fn(({ signal: requestedSignal }: { signal?: AbortSignal } = {}) => {
+      readCount += 1;
+      if (readCount === 1 || readCount > 2) return Promise.resolve(snapshot());
+      signal = requestedSignal;
+      return new Promise<SessionSnapshotResponse>((_resolve, reject) => {
+        requestedSignal?.addEventListener('abort', () => {
+          const abort = new Error('The operation was aborted');
+          abort.name = 'AbortError';
+          reject(abort);
+        }, { once: true });
+      });
+    });
+    const view: SessionViewFacade = {
+      ...fakeView({ snapshot: vi.fn() }, {}),
+      snapshot: (options = {}) => reads(options),
+    };
+    const controller = new SessionController({} as KikiClient, view, 'session_test');
+    try {
+      await controller.open();
+      const resync = controller.resync();
+      await waitFor(() => controller.getState().resyncing);
+      controller.suspend();
+      expect(signal?.aborted).toBe(true);
+      await resync;
+      expect(controller.getState().resyncing).toBe(false);
+      await controller.resume();
+      expect(reads).toHaveBeenCalledTimes(3);
+      expect(controller.getState()).toMatchObject({ resyncing: false, resyncFailed: false });
+    } finally {
+      controller.close();
+    }
+  });
+
+  it('ignores a late snapshot after suspension bumps the view attachment', async () => {
+    const { controller, client } = await openController();
+    const late = deferred<SessionSnapshotResponse>();
+    client.snapshot.mockReturnValueOnce(late.promise);
+    const resync = controller.resync();
+    await waitFor(() => controller.getState().resyncing);
+    controller.suspend();
+    expect(controller.getState().resyncing).toBe(false);
+    late.resolve(snapshot({ as_of_seq: 99 }));
+    await resync;
+    expect(controller.getState()).toMatchObject({ resyncing: false, resyncFailed: false });
+    await controller.resume();
+    expect(client.snapshot).toHaveBeenCalledTimes(3);
+    expect(controller.getState().cursor).toEqual({ seq: 10, epoch: 'epoch-1' });
+    controller.close();
+  });
+
+  it('does not mark resyncFailed when resume precedes async AbortError settlement from suspend', async () => {
+    let rejectAborted!: (reason: Error) => void;
+    let readCount = 0;
+    const reads = vi.fn(({ signal: requestedSignal }: { signal?: AbortSignal } = {}) => {
+      readCount += 1;
+      if (readCount === 1 || readCount > 2) return Promise.resolve(snapshot({ as_of_seq: readCount === 3 ? 21 : 10 }));
+      return new Promise<SessionSnapshotResponse>((_resolve, reject) => {
+        requestedSignal?.addEventListener('abort', () => {
+          rejectAborted = reject;
+        }, { once: true });
+      });
+    });
+    const view: SessionViewFacade = {
+      ...fakeView({ snapshot: vi.fn() }, {}),
+      snapshot: (options = {}) => reads(options),
+    };
+    const controller = new SessionController({} as KikiClient, view, 'session_test');
+    try {
+      await controller.open();
+      const resync = controller.resync();
+      await waitFor(() => controller.getState().resyncing);
+      controller.suspend();
+      const resumed = controller.resume();
+      const abort = new Error('The operation was aborted');
+      abort.name = 'AbortError';
+      rejectAborted(abort);
+      await Promise.all([resync, resumed]);
+      expect(reads).toHaveBeenCalledTimes(3);
+      expect(controller.getState()).toMatchObject({
+        resyncing: false,
+        resyncFailed: false,
+        resyncAttempt: 0,
+        cursor: { seq: 21, epoch: 'epoch-1' },
+      });
+    } finally {
+      controller.close();
+    }
+  });
+
   it('records a definite absence and keeps an internal history miss visible', async () => {
     const gone = new SessionController(
       {} as KikiClient,
@@ -5508,6 +5600,52 @@ describe('SessionController transcript authority', () => {
       },
     }));
     expect(controller.getState().blocks).toEqual([]);
+    controller.close();
+  });
+
+  it('defers a queued rewrite resync across suspension', async () => {
+    const { controller, client, flushAll } = await openTranscriptController();
+    controller.handleTranscript(asTranscriptEvent({
+      type: 'transcript.reset',
+      agent_id: 'main',
+      cursor: { seq: 1, epoch: 'epoch-before-rewrite' },
+      snapshot: {
+        items: [{
+          kind: 'turn', turnId: 't-suspend-rewrite', ordinal: 1, state: 'completed',
+          origin: { kind: 'user' }, prompt: 'Keep this until the rewrite baseline arrives.', steps: [],
+        }],
+        tasks: [], interactions: [], attachments: [], todos: [], prompts: [], meta: {},
+      },
+    }));
+    const ordinary = deferred<SessionSnapshotResponse>();
+    const rewrite = deferred<SessionSnapshotResponse>();
+    client.snapshot.mockReturnValueOnce(ordinary.promise).mockReturnValueOnce(rewrite.promise);
+    void controller.resync();
+    await waitFor(() => controller.getState().resyncing);
+    void controller.resync({ rewrite: true });
+    controller.suspend();
+    expect(controller.getState().resyncing).toBe(false);
+    ordinary.resolve(snapshot({ as_of_seq: 11 }));
+    await Promise.resolve();
+    const resumed = controller.resume();
+    await waitFor(() => client.snapshot.mock.calls.length === 3);
+    expect(controller.getState().resyncing).toBe(true);
+    controller.handleTranscript(asTranscriptEvent({
+      type: 'transcript.ops',
+      agent_id: 'main',
+      seq: 2,
+      cursor: { seq: 2, epoch: 'epoch-before-rewrite' },
+      through_seq: 2,
+      ops: [{ op: 'items.remove', ids: ['t-suspend-rewrite'] }],
+    }));
+    flushAll();
+    expect(controller.getState().blocks.find((block) => block.kind === 'user')).toMatchObject({
+      text: 'Keep this until the rewrite baseline arrives.',
+    });
+    rewrite.resolve(snapshot({ as_of_seq: 12 }));
+    await resumed;
+    await waitFor(() => !controller.getState().resyncing && !controller.getState().resyncFailed);
+    expect(client.snapshot).toHaveBeenCalledTimes(3);
     controller.close();
   });
 

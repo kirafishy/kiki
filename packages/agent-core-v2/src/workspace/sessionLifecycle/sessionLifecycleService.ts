@@ -72,6 +72,7 @@ import { DEFAULT_AGENT_PROFILE_NAME, type AgentProfile } from '#/app/agentProfil
 import { isFileId } from '#/app/file/fileService';
 import { SESSION_MEDIA_DIR } from '#/agent/media/mediaRef';
 import {
+  type AgentMeta,
   externalClientMetaOf,
   ISessionMetadata,
   PROMOTED_FROM_KEY,
@@ -137,9 +138,15 @@ import {
   sliceSubagentRecordsAtTime,
 } from './internal/forkTurnSlice';
 import {
+  collectPromotedDescendantIds,
+  filterPromotedDescendantRecords,
   filterPromotedRecords,
+  normalizePromotedDescendantMeta,
+  normalizePromotedTaskDocument,
   retargetPromotedRecords,
+  settlePromotedWireRecords,
   sliceSettledAgentRecords,
+  type PromotedDescendantSource,
   type PromotionSource,
 } from './internal/promoteAgent';
 import {
@@ -194,7 +201,11 @@ function isPersistenceFailure(error: unknown): boolean {
   return typeof code === 'string' && (code.startsWith('storage.') || code.startsWith('persistence.'));
 }
 
-function aggregateSessionUsage(handle: ISessionScopeHandle): SessionUsageSummary | undefined {
+function aggregateSessionUsage(
+  handle: ISessionScopeHandle,
+  coldDescendantRecords: readonly (readonly WireRecord[])[] = [],
+  coldDescendantMetas: readonly AgentMeta[] = [],
+): SessionUsageSummary | undefined {
   if (handle.accessor.get(ISessionContext).isPrivate?.() === true) return undefined;
   let total: TokenUsage | undefined;
   const byModel: Record<string, TokenUsage> = {};
@@ -207,6 +218,30 @@ function aggregateSessionUsage(handle: ISessionScopeHandle): SessionUsageSummary
         total = total === undefined ? { ...agentTotal } : addUsage(total, agentTotal);
       }
     } catch {}
+  }
+  for (let index = 0; index < coldDescendantRecords.length; index += 1) {
+    const records = coldDescendantRecords[index]!;
+    let foundWireUsage = false;
+    for (const record of records) {
+      if (record.type !== 'usage.record') continue;
+      const model = typeof record['model'] === 'string' ? record['model'] : undefined;
+      const usage = record['usage'] as TokenUsage | undefined;
+      if (model === undefined || usage === undefined || typeof usage.inputOther !== 'number') continue;
+      foundWireUsage = true;
+      byModel[model] = byModel[model] === undefined ? { ...usage } : addUsage(byModel[model]!, usage);
+      total = total === undefined ? { ...usage } : addUsage(total, usage);
+    }
+    if (!foundWireUsage) {
+      const meta = coldDescendantMetas[index];
+      if (meta?.usage !== undefined) {
+        total = total === undefined ? { ...meta.usage } : addUsage(total, meta.usage);
+        if (meta.model !== undefined && meta.model.length > 0) {
+          byModel[meta.model] = byModel[meta.model] === undefined
+            ? { ...meta.usage }
+            : addUsage(byModel[meta.model]!, meta.usage);
+        }
+      }
+    }
   }
   if (total === undefined) return undefined;
   return {
@@ -1547,6 +1582,21 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
     }
     const sourceContext = sourceHandle?.accessor.get(ISessionContext);
     const settled = sliceSettledAgentRecords(await this.readSourceWireRecords(sourceHandle, sourceId, opts.agentId, false));
+    const descendantNodes = collectPromotedDescendantIds(sourceMeta?.agents, opts.agentId);
+    const descendants: PromotedDescendantSource[] = [];
+    for (const node of descendantNodes) {
+      const descendantSettled = sliceSettledAgentRecords(
+        await this.readSourceWireRecords(sourceHandle, sourceId, node.agentId, false),
+      );
+      descendants.push({
+        agentId: node.agentId,
+        parentAgentId: node.parentAgentId,
+        agentMeta: node.agentMeta,
+        records: descendantSettled.records,
+        lastTurnReason: descendantSettled.lastTurnReason,
+        wasOpen: descendantSettled.wasOpen,
+      });
+    }
     const sessionCwd = sourceContext?.cwd ?? indexSummary?.cwd ?? sourceMeta?.cwd ?? this.workspaceContext.cwd;
     const sourceSessionDir = sourceContext?.sessionDir ?? sessionDirOf(this.bootstrap.homeDir, this.handlerScope, sourceId);
     const ephemeralSessionDir = join(
@@ -1568,6 +1618,7 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       agentMeta,
       records: settled.records,
       lastTurnReason: settled.lastTurnReason,
+      descendants,
       sourceSessionScope: sourceContext?.scope() ?? sessionScopeOf(this.handlerScope, sourceId),
       sourceSessionDir,
       sourceMediaDirs,
@@ -1580,8 +1631,8 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
 
   /**
    * Target half of a subagent promotion: writes the retargeted journal as the new session's `main`,
-   * copies the agent's blobs, spilled tool results and referenced session media, then binds a main
-   * agent with no delegator so it runs with the full main-agent tool set and reports to no one.
+   * copies the agent's and its descendants' blobs, spilled tool results, tasks and referenced session
+   * media, then binds a main agent with no delegator while registering settled descendant subagents.
    */
   async materializePromotion(source: PromotionSource, opts: PromoteAgentOptions): Promise<ISessionScopeHandle> {
     const targetId = opts.newSessionId ?? createSessionId();
@@ -1597,45 +1648,125 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
     const targetSessionDir = sessionDirOf(this.bootstrap.homeDir, this.handlerScope, targetId);
     let target: ISessionScopeHandle | undefined;
     try {
+      const descendants = source.descendants ?? [];
+      const descendantIdSet = new Set(descendants.map((item) => item.agentId));
       const sourceAgentDir = join(source.sourceSessionDir, 'agents', source.agentId);
+      const sourceMainHome = source.agentMeta.homedir ?? sourceAgentDir;
       const targetAgentDir = join(targetSessionDir, 'agents', MAIN_AGENT_ID);
-      for (const name of ['blobs', 'tool-results']) {
-        let children: readonly HostDirEntry[];
-        try {
-          children = await this.hostFs.readdir(join(sourceAgentDir, name));
-        } catch (error) {
-          if (isMissingFileError(error)) continue;
-          throw error;
-        }
-        await this.hostFs.mkdir(join(targetAgentDir, name), { recursive: true });
-        await this.copySessionDirEntries(join(sourceAgentDir, name), join(targetAgentDir, name), children, `agents/${MAIN_AGENT_ID}/${name}`);
-      }
-      await this.copyPromotedTaskOutputs(sourceAgentDir, targetAgentDir);
-      const retargeted = retargetPromotedRecords(
-        filterPromotedRecords(source.records),
+      const targetMediaDir = join(targetSessionDir, SESSION_MEDIA_DIR);
+      const descendantPathMappings = descendants.map((item) => [
+        item.agentMeta.homedir ?? join(source.sourceSessionDir, 'agents', item.agentId),
+        join(targetSessionDir, 'agents', item.agentId),
+      ] as const);
+
+      await this.copyPromotedAgentDirs(sourceAgentDir, targetAgentDir, MAIN_AGENT_ID);
+      const settledMain = settlePromotedWireRecords(filterPromotedRecords(source.records), {
+        sourceRootAgentId: source.agentId,
+        targetAgentId: MAIN_AGENT_ID,
+      });
+      await this.copyPromotedTaskOutputs(
+        sourceAgentDir,
+        targetAgentDir,
         source.agentId,
-        source.agentMeta.homedir ?? sourceAgentDir,
+        settledMain.settleTime,
+        settledMain.knownTaskIds,
+      );
+      const retargetedMain = retargetPromotedRecords(
+        settledMain.records,
+        source.agentId,
+        sourceMainHome,
         targetAgentDir,
         source.sourceMediaDirs,
-        join(targetSessionDir, SESSION_MEDIA_DIR),
+        targetMediaDir,
+        { extraPathMappings: descendantPathMappings },
       );
-      for (const blob of retargeted.foreignBlobs) {
-        const data = await this.storage.read(`${source.sourceSessionScope}/agents/${blob.agentId}/blobs`, blob.hash);
-        if (data === undefined) {
-          throw new Error2(ErrorCodes.FS_PATH_NOT_FOUND, `Shared blob "${blob.hash}" from agent "${blob.agentId}" is missing; the source thread was not changed.`, {
-            details: { sessionId: source.sourceSessionId, agentId: blob.agentId, hash: blob.hash },
-          });
-        }
-        await this.storage.write(`${targetScope}/agents/${MAIN_AGENT_ID}/blobs`, blob.hash, data, { atomic: true });
-      }
-      await this.copyPromotedMedia(source.sourceSessionScope, targetScope, retargeted.fileIds);
+      await this.copyPromotedForeignBlobs(
+        source.sourceSessionId,
+        source.sourceSessionScope,
+        targetScope,
+        MAIN_AGENT_ID,
+        retargetedMain.foreignBlobs,
+      );
+      const allFileIds = new Set<string>(retargetedMain.fileIds);
       await this.copyAgentWire({
         sourceHandle: undefined,
         sourceSessionId: source.sourceSessionId,
         agentId: MAIN_AGENT_ID,
         targetSessionId: targetId,
-        records: [...retargeted.records],
+        records: [...retargetedMain.records],
       });
+
+      const normalizedDescendants: { readonly agentId: string; readonly meta: AgentMeta; readonly records: readonly WireRecord[] }[] = [];
+      for (const descendant of descendants) {
+        const sourceDescDir = join(source.sourceSessionDir, 'agents', descendant.agentId);
+        const sourceDescHome = descendant.agentMeta.homedir ?? sourceDescDir;
+        const targetDescDir = join(targetSessionDir, 'agents', descendant.agentId);
+        await this.copyPromotedAgentDirs(sourceDescDir, targetDescDir, descendant.agentId);
+        const isUnsealedBranch = descendant.agentMeta.labels?.['branch'] === 'true' &&
+          (descendant.agentMeta.labels['branchSealed'] !== 'true' || descendant.wasOpen === true);
+        const fallbackTime = Math.max(
+          settledMain.settleTime,
+          descendant.agentMeta.createdAt ?? 0,
+          descendant.agentMeta.completedAt ?? 0,
+        );
+        const settledDesc = settlePromotedWireRecords(filterPromotedDescendantRecords(descendant.records), {
+          sourceRootAgentId: source.agentId,
+          targetAgentId: descendant.agentId,
+          isDescendant: true,
+          isUnsealedBranch,
+          fallbackTime,
+        });
+        await this.copyPromotedTaskOutputs(
+          sourceDescDir,
+          targetDescDir,
+          source.agentId,
+          settledDesc.settleTime,
+          settledDesc.knownTaskIds,
+        );
+        const extraPathMappings: (readonly [string, string])[] = [
+          [sourceMainHome, targetAgentDir],
+          ...descendantPathMappings.filter(([from]) => from !== sourceDescHome),
+        ];
+        const retargetedDesc = retargetPromotedRecords(
+          settledDesc.records,
+          source.agentId,
+          sourceDescHome,
+          targetDescDir,
+          source.sourceMediaDirs,
+          targetMediaDir,
+          {
+            targetOwnerAgentId: descendant.agentId,
+            preservedAgentIds: descendantIdSet,
+            extraPathMappings,
+          },
+        );
+        await this.copyPromotedForeignBlobs(
+          source.sourceSessionId,
+          source.sourceSessionScope,
+          targetScope,
+          descendant.agentId,
+          retargetedDesc.foreignBlobs,
+        );
+        for (const fileId of retargetedDesc.fileIds) allFileIds.add(fileId);
+        await this.copyAgentWire({
+          sourceHandle: undefined,
+          sourceSessionId: source.sourceSessionId,
+          agentId: descendant.agentId,
+          targetSessionId: targetId,
+          records: [...retargetedDesc.records],
+        });
+        normalizedDescendants.push({
+          agentId: descendant.agentId,
+          meta: normalizePromotedDescendantMeta(descendant, {
+            sourceRootAgentId: source.agentId,
+            targetAgentHome: targetDescDir,
+            settleTime: settledDesc.settleTime,
+          }),
+          records: retargetedDesc.records,
+        });
+      }
+
+      await this.copyPromotedMedia(source.sourceSessionScope, targetScope, allFileIds);
 
       target = await this.materializeSession({
         sessionId: targetId,
@@ -1656,6 +1787,10 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
         copiedIdentity: true,
         binding: { profile: profile.name, model, thinking, strictThinking: opts.thinking !== undefined },
       });
+      const targetMeta = target.accessor.get(ISessionMetadata);
+      if (normalizedDescendants.length > 0) {
+        await Promise.all(normalizedDescendants.map((item) => targetMeta.registerAgent(item.agentId, item.meta)));
+      }
 
       const agentName = source.agentMeta.userLabel ?? source.agentMeta.displayName ?? sourceProfileName ?? source.agentId;
       const promotedFrom: SessionPromotedFrom = {
@@ -1666,14 +1801,18 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
         promotedAt: Date.now(),
       };
       const inherited = withoutGoal(opts.metadata);
-      await target.accessor.get(ISessionMetadata).update({
+      await targetMeta.update({
         title: opts.title ?? agentName,
         titleKind: opts.title !== undefined ? 'custom' : 'generated',
         forkedFrom: source.sourceSessionId,
         promotedFrom,
         archived: false,
         lastTurnReason: source.lastTurnReason,
-        usage: aggregateSessionUsage(target),
+        usage: aggregateSessionUsage(
+          target,
+          normalizedDescendants.map((item) => item.records),
+          normalizedDescendants.map((item) => item.meta),
+        ),
         custom: { ...inherited, [PROMOTED_FROM_KEY]: promotedFrom },
       });
       await this.appendSessionIndexEntry(targetId, source.workDir);
@@ -1725,7 +1864,52 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
     }
   }
 
-  private async copyPromotedTaskOutputs(sourceAgentDir: string, targetAgentDir: string): Promise<void> {
+  private async copyPromotedAgentDirs(sourceAgentDir: string, targetAgentDir: string, targetAgentId: string): Promise<void> {
+    for (const name of ['blobs', 'tool-results']) {
+      let children: readonly HostDirEntry[];
+      try {
+        children = await this.hostFs.readdir(join(sourceAgentDir, name));
+      } catch (error) {
+        if (isMissingFileError(error)) continue;
+        throw error;
+      }
+      await this.hostFs.mkdir(join(targetAgentDir, name), { recursive: true });
+      await this.copySessionDirEntries(
+        join(sourceAgentDir, name),
+        join(targetAgentDir, name),
+        children,
+        `agents/${targetAgentId}/${name}`,
+      );
+    }
+  }
+
+  private async copyPromotedForeignBlobs(
+    sourceSessionId: string,
+    sourceSessionScope: string,
+    targetScope: string,
+    targetAgentId: string,
+    foreignBlobs: readonly { readonly agentId: string; readonly hash: string }[],
+  ): Promise<void> {
+    for (const blob of foreignBlobs) {
+      const data = await this.storage.read(`${sourceSessionScope}/agents/${blob.agentId}/blobs`, blob.hash);
+      if (data === undefined) {
+        throw new Error2(
+          ErrorCodes.FS_PATH_NOT_FOUND,
+          `Shared blob "${blob.hash}" from agent "${blob.agentId}" is missing; the source thread was not changed.`,
+          { details: { sessionId: sourceSessionId, agentId: blob.agentId, hash: blob.hash } },
+        );
+      }
+      await this.storage.write(`${targetScope}/agents/${targetAgentId}/blobs`, blob.hash, data, { atomic: true });
+    }
+  }
+
+  private async copyPromotedTaskOutputs(
+    sourceAgentDir: string,
+    targetAgentDir: string,
+    sourceRootAgentId: string,
+    settleTime: number,
+    knownTaskIds: ReadonlySet<string>,
+  ): Promise<void> {
     const sourceTasks = join(sourceAgentDir, 'tasks');
     let tasks: readonly HostDirEntry[];
     try {
@@ -1735,17 +1919,40 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       throw error;
     }
     for (const task of tasks) {
-      if (!task.isDirectory) continue;
-      let output: Uint8Array;
+      if (task.isDirectory) {
+        let output: Uint8Array;
+        try {
+          output = await this.hostFs.readBytes(join(sourceTasks, task.name, 'output.log'));
+        } catch (error) {
+          if (isMissingFileError(error)) continue;
+          throw error;
+        }
+        const targetTask = join(targetAgentDir, 'tasks', task.name);
+        await this.hostFs.mkdir(targetTask, { recursive: true });
+        await this.hostFs.writeBytes(join(targetTask, 'output.log'), output);
+        continue;
+      }
+      if (!task.isFile || !task.name.endsWith('.json') || task.name.includes('.tmp')) continue;
+      const taskId = task.name.slice(0, -'.json'.length);
+      if (!knownTaskIds.has(taskId)) continue;
+      let rawBytes: Uint8Array;
       try {
-        output = await this.hostFs.readBytes(join(sourceTasks, task.name, 'output.log'));
+        rawBytes = await this.hostFs.readBytes(join(sourceTasks, task.name));
       } catch (error) {
         if (isMissingFileError(error)) continue;
         throw error;
       }
-      const targetTask = join(targetAgentDir, 'tasks', task.name);
-      await this.hostFs.mkdir(targetTask, { recursive: true });
-      await this.hostFs.writeBytes(join(targetTask, 'output.log'), output);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(new TextDecoder().decode(rawBytes));
+      } catch {
+        continue;
+      }
+      const normalized = normalizePromotedTaskDocument(parsed, sourceRootAgentId, settleTime);
+      if (normalized === undefined) continue;
+      const targetTasksDir = join(targetAgentDir, 'tasks');
+      await this.hostFs.mkdir(targetTasksDir, { recursive: true });
+      await this.hostFs.writeBytes(join(targetTasksDir, task.name), new TextEncoder().encode(JSON.stringify(normalized)));
     }
   }
 

@@ -29,6 +29,8 @@ import {
 export const PLUGIN_RPC_VERSION = 1;
 const IDLE_MS = 90_000;
 const HANDSHAKE_MS = 15_000;
+const INTERRUPT_EXIT_GRACE_MS = 200;
+const SHUTDOWN_EXIT_GRACE_MS = 2_000;
 const HANDSHAKE_BACKOFF_BASE_MS = 15_000;
 const HANDSHAKE_BACKOFF_MAX_MS = 120_000;
 const MAX_RPC_LINE_CHARS = 16 * 1024 * 1024;
@@ -505,6 +507,7 @@ export class PluginHost {
     };
     const abort = () => interrupt(signal?.reason instanceof Error ? signal.reason : abortError('Plugin slot invocation cancelled'));
     const timer = setTimeout(() => interrupt(new Error('Plugin slot invocation timed out; its side effects were not replayed')), timeoutMs);
+    timer.unref();
     signal?.addEventListener('abort', abort, { once: true });
     try {
       await Promise.race([this.start(), interrupted]);
@@ -519,14 +522,14 @@ export class PluginHost {
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener('abort', abort);
-      if (!this.child) await this.exited;
+      if (!this.child) await this.waitForExit(INTERRUPT_EXIT_GRACE_MS);
     }
   }
 
   async terminateSlotRealm(): Promise<void> {
     this.child?.kill('SIGKILL');
     this.terminate(new Error(`Plugin ${this.id} slot realm was withdrawn; side effects were not replayed`));
-    await this.exited;
+    await this.waitForExit(SHUTDOWN_EXIT_GRACE_MS);
   }
 
   stopAndWait(): Promise<void> {
@@ -536,10 +539,21 @@ export class PluginHost {
 
   private async shutdownChild(): Promise<void> {
     if (this.child !== undefined && (this.lifecycle?.resident || this.harnessAccountSources.length > 0)) {
-      try { await this.lifecycleRequest('shutdown', {}); await this.exited; } catch {}
+      try { await this.lifecycleRequest('shutdown', {}); await this.waitForExit(SHUTDOWN_EXIT_GRACE_MS); } catch {}
     }
     this.stop();
-    await this.exited;
+    await this.waitForExit(SHUTDOWN_EXIT_GRACE_MS);
+  }
+
+  private waitForExit(timeoutMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, timeoutMs);
+      timer.unref();
+      void this.exited.finally(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 
   stop(): void {
@@ -962,10 +976,16 @@ export class PluginHost {
     for (const call of this.pending.values()) call.reject(reason);
     this.pending.clear();
     if (child !== undefined) {
+      child.stdin.on('error', () => undefined);
+      child.stdout.on('error', () => undefined);
+      child.stderr.on('error', () => undefined);
+      child.stdout.removeAllListeners('data');
+      child.stderr.removeAllListeners('data');
       child.stdin.destroy();
       child.stdout.destroy();
       child.stderr.destroy();
-      if (!child.killed) child.kill();
+      if (!child.killed) child.kill('SIGKILL');
+      child.unref();
     }
     this.ready = undefined;
   }

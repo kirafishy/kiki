@@ -702,12 +702,13 @@ export class PluginHostService extends Service implements IPluginHostService {
     context: {
       readonly sessionId: string;
       readonly agentId: string;
+      readonly workspaceId?: string;
       readonly profileName?: string;
       readonly modelAlias?: string;
       readonly workspaceRoot?: string;
     },
   ): Promise<string | undefined> {
-    const workspaceId = await this.resolvePluginSessionWorkspaceId(context.sessionId);
+    const workspaceId = context.workspaceId ?? await this.resolvePluginSessionWorkspaceId(context.sessionId);
     if (this.usage !== undefined) {
       const allowed = await this.usage.allows(workspaceId, pluginId, context.sessionId);
       if (!allowed) return undefined;
@@ -1184,8 +1185,12 @@ export class PluginHostService extends Service implements IPluginHostService {
           if (this.flags?.enabled(pluginAppLifecycleFlag.id) !== true) throw new Error('App plugin lifecycle is not enabled in this Kiki build');
           const host = this.getHost(info);
           if (this.activated.get(host) !== JSON.stringify(settings) || !host.running) {
-            await host.activate(settings, this.bootstrap.osHomeDir, path.join(this.bootstrap.homeDir, 'plugins', 'data', info.id));
-            this.activated.set(host, JSON.stringify(settings));
+            const activation = host.activate(settings, this.bootstrap.osHomeDir, path.join(this.bootstrap.homeDir, 'plugins', 'data', info.id))
+              .then(() => {
+                if (this.hosts.get(info.id) === host) this.activated.set(host, JSON.stringify(settings));
+              });
+            if (signal === undefined) await activation;
+            else await abortable(activation, signal);
           }
         }
         return action(info, settings);
@@ -1221,6 +1226,19 @@ export class PluginHostService extends Service implements IPluginHostService {
   }
 
   invokeSlot<TPayload, TResult>(invocation: Omit<IsolatedPluginInvocation<TPayload>, 'generation'>): Promise<IsolatedPluginResult<TResult>> {
+    const timeoutMs = invocation.timeoutMs;
+    const validTimeout = timeoutMs !== undefined && Number.isSafeInteger(timeoutMs) && timeoutMs >= 1 && timeoutMs <= 2147483647;
+    const deadline = validTimeout ? Date.now() + timeoutMs : undefined;
+    const timeoutController = validTimeout ? new AbortController() : undefined;
+    const timer = validTimeout
+      ? setTimeout(() => timeoutController!.abort(new Error('Plugin slot invocation timed out; its side effects were not replayed')), timeoutMs)
+      : undefined;
+    timer?.unref();
+    const requestSignal = timeoutController === undefined
+      ? invocation.signal
+      : invocation.signal === undefined
+        ? timeoutController.signal
+        : AbortSignal.any([invocation.signal, timeoutController.signal]);
     return this.runRequest(invocation.pluginId, async (info, settings) => {
       const plugin = info.manifest?.kiki;
       if (!info.enabled || info.state !== 'ok' || !plugin?.entry || !plugin.slots?.includes(invocation.slot as ExtensionSlotId)) {
@@ -1250,13 +1268,16 @@ export class PluginHostService extends Service implements IPluginHostService {
         if (gate?.revoked || this.closing || this.slotRegistrations.get(info.id) !== record) throw new Error('Plugin invocation was withdrawn');
       };
       assertAdmitted();
-      const request = { ...invocation, pluginId: info.id, generation };
+      const remainingTimeoutMs = deadline === undefined ? invocation.timeoutMs : Math.max(1, deadline - Date.now());
+      const request = { ...invocation, pluginId: info.id, generation, timeoutMs: remainingTimeoutMs };
       const result = pool
         ? await pool.invoke<TPayload, TResult>(request)
         : await this.getHost(info).invokeSlot<TPayload, TResult>(request, settings);
       assertAdmitted();
       return result;
-    }, invocation.signal);
+    }, requestSignal).finally(() => {
+      if (timer !== undefined) clearTimeout(timer);
+    });
   }
 
   private async withdrawSlot(pluginId: string): Promise<void> {

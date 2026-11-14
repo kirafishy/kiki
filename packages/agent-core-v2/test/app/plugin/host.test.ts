@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import type { Readable } from 'node:stream';
@@ -875,6 +875,109 @@ describe('PluginHostService extension port bridge', () => {
         text: '',
         suppressRuntimeContext: false,
       });
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  it('settles timed-out slot calls promptly when a grandchild holds inherited stdio handles and recovers cleanly', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'plugin-slot-grandchild-'));
+    const entry = join(root, 'entry.mjs');
+    const pidFile = join(root, 'grandchild.pid');
+    await writeFile(entry, `
+      import { spawn } from 'node:child_process';
+      import { writeFileSync } from 'node:fs';
+      export const slots = {
+        'E5:prompt-context': async (payload) => {
+          if (payload?.fast === true) return 'recovered';
+          const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 5000)'], {
+            stdio: 'inherit',
+            detached: true,
+          });
+          writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
+          child.unref();
+          await new Promise(() => {});
+        },
+      };
+    `);
+    const slotHost = new PluginHost('grandchild-slot', entry, []);
+    try {
+      const startedAt = Date.now();
+      await expect(slotHost.invokeSlot({
+        pluginId: 'grandchild-slot',
+        slot: 'E5:prompt-context',
+        payload: {},
+        timeoutMs: 250,
+        generation: 1,
+      }, {})).rejects.toThrow('Plugin slot invocation timed out');
+      const elapsedMs = Date.now() - startedAt;
+      expect(elapsedMs).toBeLessThan(1_800);
+
+      const next = await slotHost.invokeSlot({
+        pluginId: 'grandchild-slot',
+        slot: 'E5:prompt-context',
+        payload: { fast: true },
+        timeoutMs: 3_000,
+        generation: 2,
+      }, {});
+      expect(next.value).toBe('recovered');
+    } finally {
+      await slotHost.stopAndWait();
+      const rawPid = await readFile(pidFile, 'utf8').catch(() => '');
+      const pid = Number.parseInt(rawPid.trim(), 10);
+      if (Number.isInteger(pid) && pid > 0) {
+        try { process.kill(pid, 'SIGKILL'); } catch {}
+      }
+      await rm(root, { recursive: true, force: true, maxRetries: 4, retryDelay: 25 });
+    }
+  });
+
+  it('propagates explicit workspaceId through renderPromptSections without falling back to sessionIndex during session creation', async () => {
+    const harness = await createExtensionBridgeHarness();
+    try {
+      await harness.hosts.ready;
+      const source = join(harness.root, 'ws-context-plugin');
+      await mkdir(source, { recursive: true });
+      await writeFile(join(source, 'entry.mjs'), `
+        export const slots = {
+          'E5:prompt-context': async (payload) => ({
+            sections: [{ title: 'Workspace Echo', content: String(payload.workspaceId) + ':' + String(payload.sessionId) }],
+          }),
+        };
+      `);
+      await writeFile(join(source, 'kimi.plugin.json'), JSON.stringify({
+        name: 'ws-context-plugin',
+        version: '1.0.0',
+        'x-kiki': {
+          engines: { kiki: '^0.4.3' },
+          entry: './entry.mjs',
+          promptContext: true,
+        },
+      }));
+      const plan = await harness.plugins.previewPlugin({ source });
+      await harness.plugins.installPlugin({ source, fingerprint: plan.fingerprint, consent: true });
+
+      const indexSpy = vi.spyOn(harness.host.app.accessor.get(ISessionIndex), 'get');
+
+      const denied = await harness.registry.renderPromptSections({
+        sessionId: 'sess-creating',
+        agentId: 'main',
+        workspaceId: 'ws-creating',
+      });
+      expect(denied).toEqual({ text: '', suppressRuntimeContext: false });
+      expect(indexSpy).not.toHaveBeenCalled();
+
+      await harness.usage.set({ workspaceId: 'ws-creating', pluginId: 'ws-context-plugin', override: 'on' });
+      const rendered = await harness.registry.renderPromptSections({
+        sessionId: 'sess-creating',
+        agentId: 'main',
+        workspaceId: 'ws-creating',
+      });
+      expect(rendered).toEqual({
+        text: '### Workspace Echo\nws-creating:sess-creating',
+        suppressRuntimeContext: false,
+      });
+      expect(indexSpy).not.toHaveBeenCalled();
     } finally {
       await harness.dispose();
     }

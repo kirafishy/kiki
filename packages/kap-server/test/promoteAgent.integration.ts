@@ -10,17 +10,22 @@ import {
   IAgentPromptService,
   IAgentScopeContext,
   IAgentStateService,
+  IAgentTaskService,
   ISessionContext,
   ISessionManager,
   ensureMainAgent,
   normalizeAgentProfile,
 } from '@kiki/agent-core-v2';
 import { ExecutorSessionUpdated } from '@kiki/agent-core-v2/agent/execution/externalExecutorOps';
-import { ContextAppendMessage } from '@kiki/agent-core-v2/agent/contextMemory/contextEvents';
-import { turnKey } from '@kiki/agent-core-v2/agent/loop/turnOps';
+import { BranchBase, ContextAppendMessage } from '@kiki/agent-core-v2/agent/contextMemory/contextEvents';
+import { TurnEnded, TurnPrompt, turnKey } from '@kiki/agent-core-v2/agent/loop/turnOps';
 import { SESSION_MEDIA_DIR } from '@kiki/agent-core-v2/agent/media/mediaRef';
 import { PermissionRecordApprovalResult, permissionRulesKey } from '@kiki/agent-core-v2/agent/permissionRules/permissionRulesOps';
+import { TaskStarted, TaskTerminated } from '@kiki/agent-core-v2/agent/task/taskOps';
+import { IAgentListTool } from '@kiki/agent-core-v2/agent/tools/agent-list/agent-list';
+import { AgentBranchSealed } from '@kiki/agent-core-v2/features/btw/branchOps';
 import { IAgentLifecycleService } from '@kiki/agent-core-v2/session/agentLifecycle/agentLifecycle';
+import { SubagentCompleted, SubagentSpawned } from '@kiki/agent-core-v2/session/subagent/mirrorAgentRun';
 import { autonomousReceiptsKey } from '@kiki/agent-core-v2/session/subagent/autonomousReceiptOps';
 import { ToolsUpdateStore, todoKey } from '@kiki/agent-core-v2/session/todo/todoOps';
 import { ISessionMetadata } from '@kiki/agent-core-v2/session/sessionMetadata/sessionMetadata';
@@ -263,6 +268,382 @@ it('rewrites media paths recorded before an ephemeral source was saved and moved
   } finally {
     await client.close();
     await server.close();
+    await rm(home, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });
+  }
+}, 60_000);
+
+it('preserves settled subagent cards, tasks, and full child/grandchild/branch subtrees while settling in-flight descendants', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'promote-agent-subtree-'));
+  const workDir = join(home, 'workspace');
+  await mkdir(workDir);
+  let pendingInflight: ServerResponse | undefined;
+  let inflightObserved!: () => void;
+  const inflightReceived = new Promise<void>((resolve) => { inflightObserved = resolve; });
+  const finishResponse = (response: ServerResponse, content: string) => {
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    response.end(`data: ${JSON.stringify({ id: 'fixture-sub', choices: [{ index: 0, delta: { content }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+  };
+  const provider = createServer((request, response) => {
+    void (async () => {
+      for await (const _chunk of request) {}
+      pendingInflight = response;
+      inflightObserved();
+    })();
+  });
+  await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const address = provider.address();
+  if (address === null || typeof address === 'string') throw new Error('Missing fixture provider address');
+  await writeFile(join(home, 'config.toml'), `default_model = "fixture"\n[search]\nenabled = false\n[providers.fixture]\ntype = "openai"\nbase_url = "http://127.0.0.1:${address.port}/v1"\napi_key = "fixture"\n[models.fixture]\nprovider = "fixture"\nmodel = "fixture"\nmax_context_size = 100000\ncapabilities = ["thinking"]\nsupport_efforts = ["low", "medium", "high"]\ndefault_effort = "medium"\n`);
+  const server = await startServer({ homeDir: home, port: 0, logLevel: 'silent', hostIdentity: TEST_HOST_IDENTITY });
+  const client = createKlient({ endpoint: `http://127.0.0.1:${server.port}`, token: server.localOwnerToken });
+  const registration = server.core.accessor.get(IAgentProfileRegistry).register({
+    sourceId: 'promote-subtree-fixture', priority: 40,
+    contribution: {
+      profiles: [
+        normalizeAgentProfile({
+          name: 'researcher', main: false, definitionId: 'fixture:researcher', description: 'Fixture researcher',
+          modelAlias: 'fixture', thinkingEffort: 'low', systemPrompt: () => 'Research.',
+        }),
+        normalizeAgentProfile({
+          name: 'worker', main: false, definitionId: 'fixture:worker', description: 'Fixture worker',
+          modelAlias: 'fixture', thinkingEffort: 'low', systemPrompt: () => 'Work.',
+        }),
+      ],
+    },
+  });
+  try {
+    const manager = server.core.accessor.get(ISessionManager);
+    const source = await manager.create({ workDir, mainAgentBinding: { profile: 'agent', model: 'fixture', thinking: 'low' } });
+    const lifecycle = source.accessor.get(IAgentLifecycleService);
+    const sessionMeta = source.accessor.get(ISessionMetadata);
+    const storage = server.core.accessor.get(IFileSystemStorageService);
+
+    const rootSub = await lifecycle.create({
+      agentId: 'agent-research',
+      delegator: { kind: 'agent', agentId: 'main' },
+      userLabel: 'Lead researcher',
+      binding: { profile: 'researcher', model: 'fixture', thinking: 'low' },
+    });
+    const childSub = await lifecycle.create({
+      agentId: 'agent-child',
+      delegator: { kind: 'agent', agentId: 'agent-research' },
+      userLabel: 'Worker slice',
+      labels: {
+        parentAgentId: 'agent-research',
+        profileName: 'worker',
+        collaborationTaskName: 'worker_slice',
+        collaborationAgentType: 'worker',
+      },
+      binding: { profile: 'worker', model: 'fixture', thinking: 'low' },
+    });
+    const grandchildSub = await lifecycle.create({
+      agentId: 'agent-grandchild',
+      delegator: { kind: 'agent', agentId: 'agent-child' },
+      userLabel: 'Nested helper',
+      labels: {
+        parentAgentId: 'agent-child',
+        profileName: 'worker',
+        collaborationTaskName: 'nested_helper',
+        collaborationAgentType: 'worker',
+      },
+      binding: { profile: 'worker', model: 'fixture', thinking: 'low' },
+    });
+    const branchSub = await lifecycle.create({
+      agentId: 'agent-branch',
+      delegator: { kind: 'agent', agentId: 'agent-research' },
+      forkedFrom: 'agent-research',
+      userLabel: 'Side check',
+      labels: {
+        parentAgentId: 'agent-research',
+        branch: 'true',
+        branchSeed: 'verbatim',
+        branchSealed: 'true',
+      },
+      binding: { profile: 'researcher', model: 'fixture', thinking: 'low' },
+    });
+    const inflightSub = await lifecycle.create({
+      agentId: 'agent-inflight',
+      delegator: { kind: 'agent', agentId: 'agent-research' },
+      userLabel: 'Active probe',
+      labels: {
+        parentAgentId: 'agent-research',
+        profileName: 'worker',
+        collaborationTaskName: 'active_probe',
+        collaborationAgentType: 'worker',
+      },
+      binding: { profile: 'worker', model: 'fixture', thinking: 'low' },
+    });
+
+    const childDispatcher = childSub.accessor.get(IEventDispatcher);
+    await childDispatcher.dispatch(new TurnPrompt({
+      turnId: 0,
+      input: [{ type: 'text', text: 'Child slice prompt.' }],
+      origin: { kind: 'user' },
+    }));
+    await childDispatcher.dispatch(new ContextAppendMessage({
+      message: {
+        role: 'user', id: 'child-msg-1', origin: { kind: 'user' }, toolCalls: [],
+        content: [{ type: 'text', text: 'Child slice prompt.' }],
+      },
+    }));
+    await childDispatcher.dispatch(new ContextAppendMessage({
+      message: {
+        role: 'assistant', id: 'child-msg-2', toolCalls: [],
+        content: [{ type: 'text', text: 'Child slice completed.' }],
+      },
+    }));
+    await childDispatcher.dispatch(new TurnEnded({ turnId: 0, reason: 'completed' }));
+    await childDispatcher.flush();
+
+    const grandchildDispatcher = grandchildSub.accessor.get(IEventDispatcher);
+    await grandchildDispatcher.dispatch(new TurnPrompt({
+      turnId: 0,
+      input: [{ type: 'text', text: 'Grandchild lookup.' }],
+      origin: { kind: 'user' },
+    }));
+    await grandchildDispatcher.dispatch(new ContextAppendMessage({
+      message: {
+        role: 'user', id: 'grandchild-msg-1', origin: { kind: 'user' }, toolCalls: [],
+        content: [{ type: 'text', text: 'Grandchild lookup.' }],
+      },
+    }));
+    await grandchildDispatcher.dispatch(new ContextAppendMessage({
+      message: {
+        role: 'assistant', id: 'grandchild-msg-2', toolCalls: [],
+        content: [{ type: 'text', text: 'Grandchild lookup finished.' }],
+      },
+    }));
+    await grandchildDispatcher.dispatch(new TurnEnded({ turnId: 0, reason: 'completed' }));
+    await grandchildDispatcher.flush();
+
+    const branchDispatcher = branchSub.accessor.get(IEventDispatcher);
+    await branchDispatcher.dispatch(new ContextAppendMessage({
+      message: {
+        role: 'user', id: 'branch-seed-1', origin: { kind: 'user' }, toolCalls: [],
+        content: [{ type: 'text', text: 'Inherited parent message.' }],
+      },
+    }));
+    await branchDispatcher.dispatch(new BranchBase({
+      version: 1,
+      parentAgentId: 'agent-research',
+      seed: 'verbatim',
+      inheritedCount: 1,
+    }));
+    await branchDispatcher.dispatch(new AgentBranchSealed({ sealed: true }));
+    await branchDispatcher.flush();
+
+    const doneTaskId = 'subagent-done-12345678';
+    const openTaskId = 'subagent-open-87654321';
+    await sessionMeta.updateAgent('agent-child', (current) => ({
+      ...current,
+      status: 'completed',
+      completedAt: Date.now(),
+      resultSummary: 'Child slice completed.',
+      taskId: doneTaskId,
+    }));
+    await sessionMeta.updateAgent('agent-grandchild', (current) => ({
+      ...current,
+      status: 'completed',
+      completedAt: Date.now(),
+      resultSummary: 'Grandchild lookup finished.',
+    }));
+    await sessionMeta.updateAgent('agent-branch', (current) => ({
+      ...current,
+      status: 'completed',
+      completedAt: Date.now(),
+    }));
+    await sessionMeta.drain();
+
+    const rootDispatcher = rootSub.accessor.get(IEventDispatcher);
+    const rootScope = rootSub.accessor.get(IAgentScopeContext);
+    await rootDispatcher.dispatch(new ContextAppendMessage({
+      message: {
+        role: 'user', id: 'root-msg-1', origin: { kind: 'user' }, toolCalls: [],
+        content: [{ type: 'text', text: 'Coordinate child slices.' }],
+      },
+    }));
+    await rootDispatcher.dispatch(new SubagentSpawned({
+      subagentId: 'agent-child',
+      subagentName: 'worker',
+      name: 'worker_slice',
+      parentToolCallId: 'call-child',
+      parentAgentId: 'agent-research',
+      callerAgentId: 'agent-research',
+      description: 'Run worker slice',
+      userLabel: 'Worker slice',
+      runInBackground: true,
+      model: 'fixture',
+      taskId: doneTaskId,
+    }));
+    const doneTaskInfo = {
+      taskId: doneTaskId,
+      kind: 'agent' as const,
+      agentId: 'agent-child',
+      ownerAgentId: 'agent-research',
+      profile: 'worker',
+      collaborationTaskName: 'worker_slice',
+      collaborationAgentType: 'worker',
+      description: 'Run worker slice',
+      status: 'completed' as const,
+      startedAt: 100,
+      endedAt: 200,
+    };
+    await rootDispatcher.dispatch(new TaskStarted({ info: { ...doneTaskInfo, status: 'running', endedAt: null } }));
+    await rootDispatcher.dispatch(new SubagentCompleted({
+      subagentId: 'agent-child',
+      resultSummary: 'Child slice completed.',
+      taskId: doneTaskId,
+    }));
+    await rootDispatcher.dispatch(new TaskTerminated({ info: doneTaskInfo, outputTail: 'Child slice completed.' }));
+
+    const openTaskInfo = {
+      taskId: openTaskId,
+      kind: 'agent' as const,
+      agentId: 'agent-inflight',
+      ownerAgentId: 'agent-research',
+      profile: 'worker',
+      collaborationTaskName: 'active_probe',
+      collaborationAgentType: 'worker',
+      description: 'Run active probe',
+      status: 'running' as const,
+      startedAt: 300,
+      endedAt: null,
+    };
+    await rootDispatcher.dispatch(new SubagentSpawned({
+      subagentId: 'agent-inflight',
+      subagentName: 'worker',
+      name: 'active_probe',
+      parentToolCallId: 'call-inflight',
+      parentAgentId: 'agent-research',
+      callerAgentId: 'agent-research',
+      description: 'Run active probe',
+      userLabel: 'Active probe',
+      runInBackground: true,
+      model: 'fixture',
+      taskId: openTaskId,
+    }));
+    await rootDispatcher.dispatch(new TaskStarted({ info: openTaskInfo }));
+    await rootDispatcher.flush();
+
+    await Promise.all([
+      storage.write(rootScope.scope('tasks'), `${doneTaskId}.json`, new TextEncoder().encode(JSON.stringify(doneTaskInfo)), { atomic: true }),
+      storage.write(rootScope.scope(`tasks/${doneTaskId}`), 'output.log', new TextEncoder().encode('Child slice completed.'), { atomic: true }),
+      storage.write(rootScope.scope('tasks'), `${openTaskId}.json`, new TextEncoder().encode(JSON.stringify(openTaskInfo)), { atomic: true }),
+      storage.write(rootScope.scope(`tasks/${openTaskId}`), 'output.log', new TextEncoder().encode('Partial probe log'), { atomic: true }),
+    ]);
+
+    const inflightSubmitted = await inflightSub.accessor.get(IAgentPromptService).enqueue({
+      id: 'inflight-prompt',
+      message: {
+        role: 'user', id: 'inflight-prompt', origin: { kind: 'user' }, toolCalls: [],
+        content: [{ type: 'text', text: 'Keep probing in source session.' }],
+      },
+    });
+    await inflightSubmitted.launched;
+    await inflightReceived;
+    expect(inflightSub.accessor.get(IAgentLoopService).status().state).toBe('running');
+    await inflightSub.accessor.get(IEventDispatcher).flush();
+
+    const promoted = await client.session(source.id).commands.promoteAgent('agent-research', { title: 'Promoted coordinator' });
+    expect(inflightSub.accessor.get(IAgentLoopService).status().state).toBe('running');
+
+    const target = manager.get(promoted.id);
+    if (target === undefined) throw new Error('Promoted coordinator session is not live');
+    const targetContext = target.accessor.get(ISessionContext);
+    const targetMain = await ensureMainAgent(target);
+
+    const agentListTool = targetMain.accessor.get(IAgentListTool);
+    const activeExec = await agentListTool.resolveExecution({ include_finished: false });
+    if (!('execute' in activeExec)) throw new Error('Expected executable AgentList tool');
+    const activeListRaw = await activeExec.execute({
+      turnId: 0,
+      toolCallId: 'check-active',
+      signal: new AbortController().signal,
+    });
+    expect(JSON.parse(activeListRaw.output as string)).toEqual({ agents: [] });
+
+    const fullExec = await agentListTool.resolveExecution({ include_finished: true });
+    if (!('execute' in fullExec)) throw new Error('Expected executable AgentList tool');
+    const fullListRaw = await fullExec.execute({
+      turnId: 0,
+      toolCallId: 'check-all',
+      signal: new AbortController().signal,
+    });
+    const fullList = JSON.parse(fullListRaw.output as string) as { agents: Array<{ agent_id: string; status: string }> };
+    expect(new Map(fullList.agents.map((entry) => [entry.agent_id, entry.status]))).toEqual(new Map([
+      ['agent-child', 'completed'],
+      ['agent-branch', 'completed'],
+      ['agent-inflight', 'interrupted'],
+    ]));
+
+    const taskService = targetMain.accessor.get(IAgentTaskService);
+    expect(taskService.list(true)).toEqual([]);
+    const allTasks = new Map(taskService.list(false).map((task) => [task.taskId, task]));
+    expect(allTasks.get(doneTaskId)).toMatchObject({ status: 'completed', ownerAgentId: 'main' });
+    expect(allTasks.get(openTaskId)).toMatchObject({ status: 'killed', ownerAgentId: 'main' });
+
+    const persistedOpenTask = JSON.parse(
+      new TextDecoder().decode((await storage.read(targetContext.scope('agents/main/tasks'), `${openTaskId}.json`))!),
+    ) as Record<string, unknown>;
+    expect(persistedOpenTask).toMatchObject({
+      taskId: openTaskId,
+      ownerAgentId: 'main',
+      status: 'killed',
+      terminalNotificationSuppressed: true,
+    });
+
+    const liveSnapshot = await client.session(promoted.id).view.snapshot();
+    const rosterById = new Map((liveSnapshot.subagents ?? []).map((row) => [row.agent_id ?? row.id, row]));
+    expect(rosterById.get('agent-child')).toMatchObject({
+      parent_agent_id: 'main',
+      status: 'completed',
+      live: false,
+    });
+    expect(rosterById.get('agent-grandchild')).toMatchObject({
+      parent_agent_id: 'agent-child',
+      status: 'completed',
+      live: false,
+    });
+    expect(rosterById.get('agent-branch')).toMatchObject({
+      parent_agent_id: 'main',
+      is_branch: true,
+      branch_sealed: true,
+      live: false,
+    });
+    expect(rosterById.get('agent-inflight')).toMatchObject({
+      parent_agent_id: 'main',
+      status: 'cancelled',
+      live: false,
+    });
+
+    const mainTranscript = await client.session(promoted.id).view.transcript.page({ agentId: 'main' });
+    expect(JSON.stringify(mainTranscript)).toContain('worker_slice');
+    expect(JSON.stringify(mainTranscript)).toContain('active_probe');
+    const childTranscript = await client.session(promoted.id).view.transcript.page({ agentId: 'agent-child' });
+    expect(JSON.stringify(childTranscript)).toContain('Child slice completed.');
+    const grandchildTranscript = await client.session(promoted.id).view.transcript.page({ agentId: 'agent-grandchild' });
+    expect(JSON.stringify(grandchildTranscript)).toContain('Grandchild lookup.');
+
+    await manager.close(promoted.id);
+    const coldSnapshot = await client.session(promoted.id).view.snapshot();
+    const coldRoster = new Map((coldSnapshot.subagents ?? []).map((row) => [row.agent_id ?? row.id, row]));
+    expect(coldRoster.get('agent-child')).toMatchObject({ parent_agent_id: 'main', status: 'completed' });
+    expect(coldRoster.get('agent-grandchild')).toMatchObject({ parent_agent_id: 'agent-child', status: 'completed' });
+    expect(coldRoster.get('agent-branch')).toMatchObject({ parent_agent_id: 'main', is_branch: true, branch_sealed: true });
+    expect(coldRoster.get('agent-inflight')).toMatchObject({ parent_agent_id: 'main', status: 'cancelled' });
+
+    if (pendingInflight === undefined) throw new Error('Missing inflight provider response');
+    finishResponse(pendingInflight, 'Finished in source.');
+    pendingInflight = undefined;
+    await expect(inflightSubmitted.completion).resolves.toMatchObject({ state: 'completed' });
+    await inflightSub.accessor.get(IAgentLoopService).settled();
+  } finally {
+    if (pendingInflight !== undefined && !pendingInflight.writableEnded) finishResponse(pendingInflight, 'Cleanup.');
+    await registration.dispose();
+    await client.close();
+    await server.close();
+    provider.closeAllConnections();
+    await new Promise<void>((resolve) => provider.close(() => resolve()));
     await rm(home, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });
   }
 }, 60_000);
