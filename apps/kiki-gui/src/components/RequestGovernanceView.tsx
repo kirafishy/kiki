@@ -36,22 +36,21 @@ export const CONCURRENCY_RULES_SETTINGS_HREF = '/settings/ai?tab=defaults#st-car
 
 /**
  * The sidebar's Activity badge: live active and queued model request counts in
- * quiet tabular figures (`3`, `3 · +1`, `+1`) while work is running or waiting,
- * and silent when idle. A stale read keeps the last non-idle counts with a
- * hollow mark (`◦`) rather than claiming they are current.
+ * quiet tabular figures (`3`, `3 · +1`, `+1` in the expanded sidebar; `3`,
+ * `3+1`, `+1` in the collapsed rail) while work is running or waiting, and
+ * silent when idle. A stale read keeps the last non-idle counts with a hollow
+ * mark (`◦`) rather than claiming they are current.
  */
 export function RequestGovernanceBadge({ compact = false }: { compact?: boolean }) {
   const { snapshot, stale } = useRequestGovernance();
   const { t } = useI18n();
   if (snapshot === undefined || (snapshot.active === 0 && snapshot.queued === 0)) return null;
   const title = `${t('usage.governance.badge', { active: snapshot.active, queued: snapshot.queued })}${stale ? ` · ${t('usage.governance.stale', { time: snapshot.asOf })}` : ''}`;
-  const label = compact
-    ? (snapshot.active > 0 ? String(snapshot.active) : `+${snapshot.queued}`)
-    : snapshot.active > 0 && snapshot.queued > 0
-      ? `${snapshot.active} · +${snapshot.queued}`
-      : snapshot.active > 0
-        ? String(snapshot.active)
-        : `+${snapshot.queued}`;
+  const label = snapshot.active > 0 && snapshot.queued > 0
+    ? (compact ? `${snapshot.active}+${snapshot.queued}` : `${snapshot.active} · +${snapshot.queued}`)
+    : snapshot.active > 0
+      ? String(snapshot.active)
+      : `+${snapshot.queued}`;
   return (
     <span
       data-request-governance-badge
@@ -59,7 +58,7 @@ export function RequestGovernanceBadge({ compact = false }: { compact?: boolean 
       title={title}
       aria-label={title}
       className={compact
-        ? 'absolute -right-2 -bottom-1 rounded bg-paper px-0.5 font-mono text-[9px] leading-3 text-ink-faint tabular-nums'
+        ? 'absolute -right-2 -bottom-1 whitespace-nowrap rounded bg-paper px-0.5 font-mono text-[9px] leading-3 text-ink-faint tabular-nums'
         : 'ml-auto shrink-0 font-mono text-[11px] text-ink-faint tabular-nums'}
     >
       {label}

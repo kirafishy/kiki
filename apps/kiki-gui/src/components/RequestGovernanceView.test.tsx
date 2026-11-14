@@ -291,7 +291,7 @@ describe('live request governance', () => {
     expect(compactBadge()?.textContent).toBe('2');
     expect(fullBadge()?.getAttribute('aria-label')).toBe('Model requests 2, waiting 0');
 
-    // Active > 0 with queued > 0 renders active · +queued (and active in compact rail).
+    // Active > 0 with queued > 0 renders active · +queued in full and active+queued in compact rail.
     connection.client.getRequestGovernance.mockResolvedValueOnce({
       ...snapshot,
       active: 2,
@@ -299,8 +299,9 @@ describe('live request governance', () => {
     });
     await act(async () => { render(); await vi.advanceTimersByTimeAsync(1100); });
     expect(fullBadge()?.textContent).toBe('2 · +1');
-    expect(compactBadge()?.textContent).toBe('2');
+    expect(compactBadge()?.textContent).toBe('2+1');
     expect(fullBadge()?.getAttribute('aria-label')).toBe('Model requests 2, waiting 1');
+    expect(compactBadge()?.getAttribute('aria-label')).toBe('Model requests 2, waiting 1');
 
     // Active === 0 with queued > 0 renders +queued in both full and compact.
     connection.client.getRequestGovernance.mockResolvedValueOnce({

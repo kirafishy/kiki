@@ -3141,6 +3141,8 @@ describe('collapsed icon rail', () => {
     expect(container.querySelector('[data-nav-settings]')).not.toBeNull();
     expect(container.querySelector('[data-sidebar-toggle="expand"]')).not.toBeNull();
     expect(container.querySelector('[data-sidebar-toggle="collapse"]')).toBeNull();
+    await settle();
+    expect(aside?.querySelector('[data-nav-usage] [data-request-governance-badge]')?.textContent).toBe('3+2');
   });
 
   it('stays expanded by default at 1280px and wider', async () => {
