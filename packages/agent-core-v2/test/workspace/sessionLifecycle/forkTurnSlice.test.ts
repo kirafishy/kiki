@@ -391,12 +391,37 @@ describe('promoted subagent records', () => {
       expect.objectContaining({ type: 'subagent.completed', subagentId: 'agent-child', taskId, resultSummary: 'Slice finished.', time: 20 }),
     ]);
     expect(normalizePromotedDescendantMeta({
-      agentId: 'agent-child', parentAgentId: 'main', records: [], wasOpen: true,
+      agentId: 'agent-child', parentAgentId: 'main',
+      records: [{ type: 'turn.prompt', turnId: 0, time: 10 }], wasOpen: true,
       agentMeta: { type: 'sub', taskId, status: 'failed', error: 'stale failure' },
     }, {
       sourceRootAgentId: 'agent-root', targetAgentHome: '/target/agents/agent-child', settleTime: 30,
       outcome: settled.agentOutcomes.get('agent-child'),
     })).toMatchObject({ taskId, status: 'completed', completedAt: 20, resultSummary: 'Slice finished.', error: undefined });
+  });
+
+  it.each([{ startedAt: 20, selfReceipt: true }, { startedAt: 30, selfReceipt: false }])('preserves a newer cancelled turn starting at $startedAt over its preceding completed receipt', ({ startedAt, selfReceipt }) => {
+    const taskId = 'agent-receipt-12345678';
+    const resultSummary = 'Previous turn finished.';
+    const records: WireRecord[] = [
+      { type: 'turn.prompt', turnId: 0, time: 10 },
+      { type: 'turn.ended', turnId: 0, reason: 'completed', time: 20 },
+    ];
+    if (selfReceipt) records.push({ type: 'subagent.completed', subagentId: 'agent-child', taskId, resultSummary, time: 20 });
+    records.push(
+      { type: 'turn.prompt', turnId: 1, time: startedAt },
+      { type: 'turn.ended', turnId: 1, reason: 'cancelled', time: 40 },
+    );
+    const normalized = normalizePromotedDescendantMeta({
+      agentId: 'agent-child', parentAgentId: 'main', wasOpen: true, lastTurnReason: 'cancelled', records,
+      agentMeta: { type: 'sub', taskId, status: 'completed', completedAt: 20, resultSummary, error: 'stale error' },
+    }, {
+      sourceRootAgentId: 'agent-root', targetAgentHome: '/target/agents/agent-child', settleTime: 40,
+      outcome: { taskId, status: 'completed', completedAt: 20, resultSummary },
+    });
+    expect(normalized).toMatchObject({ taskId, status: 'cancelled', completedAt: 40 });
+    expect(normalized.resultSummary).toBeUndefined();
+    expect(normalized.error).toBeUndefined();
   });
 
   it.each(['completed', 'failed', 'killed', 'timed_out', 'lost'])('uses the committed %s task outcome over a conflicting wire outcome', (status) => {

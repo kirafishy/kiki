@@ -467,6 +467,14 @@ export function normalizePromotedDescendantMeta(
   const terminalSubagent = !isBranch && descendant.wasOpen !== true &&
     (meta.status === 'completed' || meta.status === 'failed' || meta.status === 'cancelled');
   const preserveOutcome = branchAlreadySealed || terminalSubagent;
+  const latestTurnIndex = descendant.records.findLastIndex((record) => record.type === 'turn.prompt' || record.type === 'turn.started');
+  const latestTurnTime = descendant.records[latestTurnIndex]?.time;
+  const outcomeBeforeLatestTurn = options.outcome !== undefined && (
+    (latestTurnTime !== undefined && options.outcome.completedAt < latestTurnTime) ||
+    descendant.records.some((record, index) => index < latestTurnIndex && record['subagentId'] === descendant.agentId &&
+      record['taskId'] === options.outcome!.taskId && (record.type === 'subagent.completed' || record.type === 'subagent.failed'))
+  );
+  const outcome = descendant.wasOpen === true && outcomeBeforeLatestTurn ? undefined : options.outcome;
 
   let status: 'completed' | 'failed' | 'cancelled';
   if (branchAlreadySealed) status = meta.status ?? 'completed';
@@ -485,14 +493,12 @@ export function normalizePromotedDescendantMeta(
     delegator: { kind: 'agent', agentId: parentAgentId },
     status,
     completedAt,
+    resultSummary: preserveOutcome ? meta.resultSummary : undefined,
+    error: preserveOutcome ? meta.error : undefined,
   };
-  if (options.outcome !== undefined && !isBranch) Object.assign(next, options.outcome);
+  if (outcome !== undefined && !isBranch) Object.assign(next, outcome);
   if (meta.forkedFrom === options.sourceRootAgentId) next['forkedFrom'] = 'main';
   if (Object.keys(labels).length > 0) next['labels'] = labels;
-  if (!preserveOutcome && options.outcome === undefined) {
-    delete next['resultSummary'];
-    delete next['error'];
-  }
   return next as AgentMeta;
 }
 

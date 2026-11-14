@@ -697,3 +697,81 @@ it('preserves settled subagent cards, tasks, and full child/grandchild/branch su
     await rm(home, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });
   }
 }, 60_000);
+
+it('preserves an earlier cold-parent receipt while cancelling a newer open descendant turn', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'promote-active-history-'));
+  const workDir = join(home, 'workspace');
+  await mkdir(workDir);
+  let requests = 0;
+  let pendingResponse: ServerResponse | undefined;
+  let requestObserved!: () => void;
+  const requestReceived = new Promise<void>((resolve) => { requestObserved = resolve; });
+  const finishResponse = (response: ServerResponse) => {
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    response.end(`data: ${JSON.stringify({ id: 'fixture-response', choices: [{ index: 0, delta: { content: 'Completed autonomous turn.' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+  };
+  const provider = createServer((request, response) => {
+    void (async () => {
+      for await (const _chunk of request) {}
+      if (++requests === 1) finishResponse(response);
+      else {
+        pendingResponse = response;
+        requestObserved();
+      }
+    })();
+  });
+  await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const address = provider.address();
+  if (address === null || typeof address === 'string') throw new Error('Missing fixture provider address');
+  await writeFile(join(home, 'config.toml'), `default_model = "fixture"\n[search]\nenabled = false\n[providers.fixture]\ntype = "openai"\nbase_url = "http://127.0.0.1:${address.port}/v1"\napi_key = "fixture"\n[models.fixture]\nprovider = "fixture"\nmodel = "fixture"\nmax_context_size = 100000\n`);
+  const server = await startServer({ homeDir: home, port: 0, logLevel: 'silent', hostIdentity: TEST_HOST_IDENTITY });
+  const client = createKlient({ endpoint: `http://127.0.0.1:${server.port}`, token: server.localOwnerToken });
+  let pendingCompletion: Promise<unknown> | undefined;
+  try {
+    const manager = server.core.accessor.get(ISessionManager);
+    const source = await manager.create({ workDir, mainAgentBinding: { profile: 'agent', model: 'fixture' } });
+    const lifecycle = source.accessor.get(IAgentLifecycleService);
+    const root = await lifecycle.create({ agentId: 'agent-root', delegator: { kind: 'agent', agentId: 'main' }, binding: { profile: 'agent', model: 'fixture' } });
+    const child = await lifecycle.create({ agentId: 'agent-child', delegator: { kind: 'agent', agentId: root.id }, binding: { profile: 'agent', model: 'fixture' } });
+    const rootScope = root.accessor.get(IAgentScopeContext).scope();
+    await lifecycle.remove(root.id);
+    const first = await child.accessor.get(IAgentPromptService).enqueue({
+      id: 'autonomous-first', message: { role: 'user', content: [{ type: 'text', text: 'Finish the first task.' }], toolCalls: [], origin: { kind: 'user' } },
+    });
+    await first.completion;
+    const metadata = source.accessor.get(ISessionMetadata);
+    await vi.waitFor(async () => expect((await metadata.read()).agents?.[child.id]?.taskId).toMatch(/^agent-receipt-/));
+    const receiptId = (await metadata.read()).agents![child.id]!.taskId!;
+    const storage = server.core.accessor.get(IFileSystemStorageService);
+    await vi.waitFor(async () => expect(await storage.read(`${rootScope}/tasks`, `${receiptId}.json`)).toBeDefined());
+    await child.accessor.get(IEventDispatcher).flush();
+    const second = await child.accessor.get(IAgentPromptService).enqueue({
+      id: 'autonomous-second', message: { role: 'user', content: [{ type: 'text', text: 'Start a new unfinished task.' }], toolCalls: [], origin: { kind: 'user' } },
+    });
+    pendingCompletion = second.completion;
+    await requestReceived;
+    expect((await metadata.read()).agents![child.id]!.taskId).toBe(receiptId);
+
+    const promoted = await client.session(source.id).commands.promoteAgent(root.id);
+    const target = manager.get(promoted.id)!;
+    const main = await ensureMainAgent(target);
+    await vi.waitFor(() => expect(main.accessor.get(IAgentTaskService).getTask(receiptId)?.status).toBe('completed'));
+    expect((await target.accessor.get(ISessionMetadata).read()).agents?.[child.id]).toMatchObject({ status: 'cancelled', resultSummary: undefined });
+    const wire: WireRecord[] = [];
+    for await (const record of server.core.accessor.get(IAppendLogStore).read<WireRecord>(target.accessor.get(ISessionContext).scope('agents/agent-child'), 'wire.jsonl')) wire.push(record);
+    expect(wire.findLast((record) => record.type === 'turn.ended')?.['reason']).toBe('cancelled');
+    expect((await client.session(promoted.id).view.snapshot()).subagents?.find((row) => (row.agent_id ?? row.id) === child.id)).toMatchObject({ status: 'cancelled' });
+    await manager.close(promoted.id);
+    expect((await client.session(promoted.id).view.snapshot()).subagents?.find((row) => (row.agent_id ?? row.id) === child.id)).toMatchObject({ status: 'cancelled' });
+    expect(child.accessor.get(IAgentLoopService).status().state).toBe('running');
+    expect(requests).toBe(2);
+  } finally {
+    if (pendingResponse !== undefined) finishResponse(pendingResponse);
+    await pendingCompletion?.catch(() => {});
+    await client.close();
+    await server.close();
+    provider.closeAllConnections();
+    await new Promise<void>((resolve) => provider.close(() => resolve()));
+    await rm(home, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });
+  }
+}, 60_000);
