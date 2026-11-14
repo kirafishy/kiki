@@ -415,7 +415,7 @@ Claude ACP、Codex ACP 与 Codex app-server 提供独立的本机历史目录。
 
 冷会话的目标读取保留已保存历史中的 `goalId`、`controlRevision` 和预算状态。没有可用检查点时，请求会等待分片准备完成并返回完整快照，无需重复 GET；各分片之间会让出事件循环。
 
-`POST /api/sessions/{session_id}/agents/{agent_id}:promote` 接受可选的 `title` 与 `profile` 字段，profile 必须已启用且可用于主 Agent。该接口把子智能体的对话、待办和笔记复制到其工作目录里的新顶层会话，返回的会话带有 `promoted_from` 来源信息。原会话、子智能体及仍在执行的工作保持不变。复制仍在运行的子智能体时，只保留到最近一个已完成步骤为止的记录，新会话把该边界记为 `cancelled`，不会自动续跑。
+`POST /api/sessions/{session_id}/agents/{agent_id}:promote` 接受可选的 `title` 与 `profile` 字段，profile 必须已启用且可用于主 Agent。该接口把子智能体的对话、待办、笔记、后代子智能体、分支及已保存的任务结果复制到其工作目录里的新顶层会话，返回的会话带有 `promoted_from` 来源信息。原会话、子智能体及仍在执行的工作保持不变。仍在运行的 Agent 只复制到最近一个已完成步骤为止，新会话把这些边界记为 `cancelled`，将未完成任务置为终态、封存未封存的分支，不会自动续跑。显式续跑复制后的 Codex 或 ACP 后代子智能体时，会新建独立的远端对话，并传入有大小限制的历史交接内容。
 
 会话在本进程中不是 live 时，快照从已保存的 main agent wire 和会话元数据读取，不会恢复该会话或其 workspace。`messages` 是压缩、撤销和编辑之后的当前逻辑 context 里最新的 100 条，按从旧到新排列。更早的逻辑条目仍存在时 `has_more` 为 true，`message_count` 等于该逻辑长度。`as_of_seq` 和 `epoch` 是会话 journal 水位。权限模式和 plan mode 来自已保存的 runtime 记录；模型和思考强度来自已保存的 agent 绑定。本进程没有测量过的 context token 总量和 breakdown 会省略。`in_flight_turn`、`pending_approvals` 和 `pending_questions` 只描述本进程里的活动，另一个进程里仍在运行的会话不会在这里被标成本地 active。
 

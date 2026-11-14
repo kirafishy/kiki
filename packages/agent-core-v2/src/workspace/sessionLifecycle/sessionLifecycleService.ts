@@ -142,11 +142,11 @@ import {
   filterPromotedDescendantRecords,
   filterPromotedRecords,
   normalizePromotedDescendantMeta,
-  normalizePromotedTaskDocument,
   retargetPromotedRecords,
   settlePromotedWireRecords,
   sliceSettledAgentRecords,
   type PromotedDescendantSource,
+  type PromotedTaskDocument,
   type PromotionSource,
 } from './internal/promoteAgent';
 import {
@@ -1663,14 +1663,10 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       const settledMain = settlePromotedWireRecords(filterPromotedRecords(source.records), {
         sourceRootAgentId: source.agentId,
         targetAgentId: MAIN_AGENT_ID,
+        taskDocuments: await this.readPromotedTaskDocuments(sourceAgentDir, source.agentId, descendantIdSet),
       });
-      await this.copyPromotedTaskOutputs(
-        sourceAgentDir,
-        targetAgentDir,
-        source.agentId,
-        settledMain.settleTime,
-        settledMain.knownTaskIds,
-      );
+      await this.copyPromotedTaskOutputs(sourceAgentDir, targetAgentDir, settledMain.tasks);
+      const agentOutcomes = new Map(settledMain.agentOutcomes);
       const retargetedMain = retargetPromotedRecords(
         settledMain.records,
         source.agentId,
@@ -1715,14 +1711,12 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
           isDescendant: true,
           isUnsealedBranch,
           fallbackTime,
+          taskDocuments: await this.readPromotedTaskDocuments(sourceDescDir, descendant.agentId, descendantIdSet),
         });
-        await this.copyPromotedTaskOutputs(
-          sourceDescDir,
-          targetDescDir,
-          source.agentId,
-          settledDesc.settleTime,
-          settledDesc.knownTaskIds,
-        );
+        await this.copyPromotedTaskOutputs(sourceDescDir, targetDescDir, settledDesc.tasks);
+        for (const [agentId, outcome] of settledDesc.agentOutcomes) {
+          if ((agentOutcomes.get(agentId)?.completedAt ?? 0) <= outcome.completedAt) agentOutcomes.set(agentId, outcome);
+        }
         const extraPathMappings: (readonly [string, string])[] = [
           [sourceMainHome, targetAgentDir],
           ...descendantPathMappings.filter(([from]) => from !== sourceDescHome),
@@ -1761,6 +1755,8 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
             sourceRootAgentId: source.agentId,
             targetAgentHome: targetDescDir,
             settleTime: settledDesc.settleTime,
+            outcome: agentOutcomes.get(descendant.agentId)?.taskId === descendant.agentMeta.taskId || descendant.agentMeta.taskId === undefined
+              ? agentOutcomes.get(descendant.agentId) : undefined,
           }),
           records: retargetedDesc.records,
         });
@@ -1903,38 +1899,23 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
     }
   }
 
-  private async copyPromotedTaskOutputs(
+  private async readPromotedTaskDocuments(
     sourceAgentDir: string,
-    targetAgentDir: string,
-    sourceRootAgentId: string,
-    settleTime: number,
-    knownTaskIds: ReadonlySet<string>,
-  ): Promise<void> {
+    ownerAgentId: string,
+    descendantIds: ReadonlySet<string>,
+  ): Promise<ReadonlyMap<string, PromotedTaskDocument>> {
+    const documents = new Map<string, PromotedTaskDocument>();
     const sourceTasks = join(sourceAgentDir, 'tasks');
     let tasks: readonly HostDirEntry[];
     try {
       tasks = await this.hostFs.readdir(sourceTasks);
     } catch (error) {
-      if (isMissingFileError(error)) return;
+      if (isMissingFileError(error)) return documents;
       throw error;
     }
     for (const task of tasks) {
-      if (task.isDirectory) {
-        let output: Uint8Array;
-        try {
-          output = await this.hostFs.readBytes(join(sourceTasks, task.name, 'output.log'));
-        } catch (error) {
-          if (isMissingFileError(error)) continue;
-          throw error;
-        }
-        const targetTask = join(targetAgentDir, 'tasks', task.name);
-        await this.hostFs.mkdir(targetTask, { recursive: true });
-        await this.hostFs.writeBytes(join(targetTask, 'output.log'), output);
-        continue;
-      }
       if (!task.isFile || !task.name.endsWith('.json') || task.name.includes('.tmp')) continue;
       const taskId = task.name.slice(0, -'.json'.length);
-      if (!knownTaskIds.has(taskId)) continue;
       let rawBytes: Uint8Array;
       try {
         rawBytes = await this.hostFs.readBytes(join(sourceTasks, task.name));
@@ -1948,11 +1929,44 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       } catch {
         continue;
       }
-      const normalized = normalizePromotedTaskDocument(parsed, sourceRootAgentId, settleTime);
-      if (normalized === undefined) continue;
-      const targetTasksDir = join(targetAgentDir, 'tasks');
-      await this.hostFs.mkdir(targetTasksDir, { recursive: true });
-      await this.hostFs.writeBytes(join(targetTasksDir, task.name), new TextEncoder().encode(JSON.stringify(normalized)));
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+      const info = parsed as Record<string, unknown>;
+      if (info['taskId'] !== taskId || (info['ownerAgentId'] !== undefined && info['ownerAgentId'] !== ownerAgentId)) continue;
+      if (info['kind'] === 'agent' && typeof info['agentId'] === 'string' && !descendantIds.has(info['agentId'])) continue;
+      let output: Uint8Array | undefined;
+      try {
+        output = await this.hostFs.readBytes(join(sourceTasks, taskId, 'output.log'));
+      } catch (error) {
+        if (!isMissingFileError(error)) throw error;
+      }
+      documents.set(taskId, { info, output });
+    }
+    return documents;
+  }
+
+  private async copyPromotedTaskOutputs(
+    sourceAgentDir: string,
+    targetAgentDir: string,
+    tasks: ReadonlyMap<string, PromotedTaskDocument>,
+  ): Promise<void> {
+    if (tasks.size === 0) return;
+    const targetTasksDir = join(targetAgentDir, 'tasks');
+    await this.hostFs.mkdir(targetTasksDir, { recursive: true });
+    for (const [taskId, task] of tasks) {
+      await this.hostFs.writeBytes(join(targetTasksDir, `${taskId}.json`), new TextEncoder().encode(JSON.stringify(task.info)));
+      let output = task.output;
+      if (output === undefined) {
+        try {
+          output = await this.hostFs.readBytes(join(sourceAgentDir, 'tasks', taskId, 'output.log'));
+        } catch (error) {
+          if (!isMissingFileError(error)) throw error;
+        }
+      }
+      if (output !== undefined) {
+        const targetTask = join(targetTasksDir, taskId);
+        await this.hostFs.mkdir(targetTask, { recursive: true });
+        await this.hostFs.writeBytes(join(targetTask, 'output.log'), output);
+      }
     }
   }
 

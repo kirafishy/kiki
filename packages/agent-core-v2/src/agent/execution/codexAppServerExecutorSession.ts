@@ -688,8 +688,9 @@ export class CodexAppServerExecutorSession implements AgentExecutorSession {
     }
     const savedHome = state.sessionRef?.ref['kikiLaunchHome'];
     const homeMismatch = typeof savedHome === 'string' && savedHome !== (this.context.descriptor.homeDir ?? '');
+    const copiedIdentity = state.sessionRef?.ref['copiedIdentity'] === true;
     const reusable =
-      !homeMismatch && agentExecutorBindingMatches(this.context.binding, state.bindingFingerprint);
+      !copiedIdentity && !homeMismatch && agentExecutorBindingMatches(this.context.binding, state.bindingFingerprint);
     const priorThreadId = reusable ? threadIdFromState(state.sessionRef) : undefined;
     if (state.sessionRef?.ref['localSource'] !== undefined && priorThreadId === undefined && !homeMismatch) {
       throw new Error2(ErrorCodes.CONFIG_INVALID, 'Imported local session binding fingerprint or thread reference changed');
@@ -728,7 +729,7 @@ export class CodexAppServerExecutorSession implements AgentExecutorSession {
         };
       }
     }
-    if (this.context.binding.execution === undefined && state.sessionRef !== undefined && !reusable) {
+    if (copiedIdentity || (this.context.binding.execution === undefined && state.sessionRef !== undefined && !reusable)) {
       const handoff = buildHandoff(this.#memory.get());
       const fresh = await this.#startFreshThread(roots, signal);
       return {

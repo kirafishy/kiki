@@ -37,9 +37,23 @@ export interface SettledAgentRecords {
   readonly wasOpen?: boolean;
 }
 
+export interface PromotedTaskDocument {
+  readonly info: Record<string, unknown>;
+  readonly output?: Uint8Array;
+}
+
+export interface PromotedAgentOutcome {
+  readonly taskId?: string;
+  readonly status: 'completed' | 'failed' | 'cancelled';
+  readonly completedAt: number;
+  readonly resultSummary?: string;
+  readonly error?: string;
+}
+
 export interface SettledPromotedWire {
   readonly records: readonly WireRecord[];
-  readonly knownTaskIds: ReadonlySet<string>;
+  readonly tasks: ReadonlyMap<string, PromotedTaskDocument>;
+  readonly agentOutcomes: ReadonlyMap<string, PromotedAgentOutcome>;
   readonly settleTime: number;
 }
 
@@ -66,7 +80,6 @@ const MAIN_DROPPED_TYPES: ReadonlySet<string> = new Set([
 
 const DESCENDANT_DROPPED_TYPES: ReadonlySet<string> = new Set([
   'forked',
-  'executor.session.updated',
   'turn.cancel',
 ]);
 
@@ -182,7 +195,13 @@ export function filterPromotedRecords(records: readonly WireRecord[]): readonly 
 export function filterPromotedDescendantRecords(records: readonly WireRecord[]): readonly WireRecord[] {
   return records.filter((record) => !isSessionScopedApprovedGrant(record) &&
     !DESCENDANT_DROPPED_TYPES.has(record.type) &&
-    !DROPPED_PREFIXES.some((prefix) => record.type.startsWith(prefix)));
+    !DROPPED_PREFIXES.some((prefix) => record.type.startsWith(prefix)))
+    .map((record) => record.type !== 'executor.session.updated' ? record : {
+      ...record,
+      sessionRef: { executorId: record['executorId'], version: 1, ref: { copiedIdentity: true } },
+      profileDeliveredSessionId: undefined,
+      lastCumulativeUsage: undefined,
+    });
 }
 
 /**
@@ -198,14 +217,20 @@ export function settlePromotedWireRecords(
     readonly isDescendant?: boolean;
     readonly isUnsealedBranch?: boolean;
     readonly fallbackTime?: number;
+    readonly taskDocuments?: ReadonlyMap<string, PromotedTaskDocument>;
   },
 ): SettledPromotedWire {
   const { sourceRootAgentId, targetAgentId } = options;
   const settleTime = Math.max(latestTime(records) ?? 0, options.fallbackTime ?? 0) || Date.now();
-  const knownTaskIds = new Set<string>();
-  const openTasks = new Map<string, Record<string, unknown>>();
+  const wireTasks = new Map<string, Record<string, unknown>>();
+  const terminatedTaskIds = new Set<string>();
   const subagentTaskIds = new Map<string, string>();
-  const subagentRuns = new Map<string, { subagentId: string; taskId?: string; state: 'running' | 'terminal' }>();
+  const subagentRuns = new Map<string, {
+    subagentId: string;
+    taskId?: string;
+    state: 'running' | 'terminal';
+    record?: WireRecord;
+  }>();
   let activeAutonomous: { turnId: number; summary: string } | undefined;
   const pendingAutonomousTurnIds = new Set<number>();
   let branchSealedSeen = false;
@@ -284,7 +309,9 @@ export function settlePromotedWireRecords(
       if (subagentId !== undefined) {
         const explicitTaskId = stringOf(record['taskId']) ?? subagentTaskIds.get(subagentId);
         const runKey = explicitTaskId ?? subagentId;
-        subagentRuns.set(runKey, { subagentId, taskId: explicitTaskId, state: 'terminal' });
+        const terminalRecord = { ...record, taskId: explicitTaskId };
+        subagentRuns.set(runKey, { subagentId, taskId: explicitTaskId, state: 'terminal', record: terminalRecord });
+        return terminalRecord;
       }
       return record;
     }
@@ -294,9 +321,12 @@ export function settlePromotedWireRecords(
       const normalizedInfo = rewritePromotedTaskInfo(record['info'], sourceRootAgentId);
       const taskId = stringOf(normalizedInfo['taskId']);
       if (taskId !== undefined) {
-        knownTaskIds.add(taskId);
-        if (isSettledTerminalTask(normalizedInfo)) openTasks.delete(taskId);
-        else openTasks.set(taskId, normalizedInfo);
+        const previous = wireTasks.get(taskId);
+        if (previous === undefined || !isSettledTerminalTask(previous) || isSettledTerminalTask(normalizedInfo)) {
+          wireTasks.set(taskId, normalizedInfo);
+        }
+        if (record.type === 'task.terminated') terminatedTaskIds.add(taskId);
+        else terminatedTaskIds.delete(taskId);
       }
       return { ...record, info: normalizedInfo };
     }
@@ -324,19 +354,74 @@ export function settlePromotedWireRecords(
     return record;
   });
 
-  for (const info of openTasks.values()) {
-    out.push({ type: 'task.terminated', info: settleOpenTaskInfo(info, settleTime), time: settleTime });
+  const tasks = new Map<string, PromotedTaskDocument>();
+  const taskIds = new Set([...wireTasks.keys(), ...(options.taskDocuments?.keys() ?? [])]);
+  for (const taskId of taskIds) {
+    const stored = options.taskDocuments?.get(taskId);
+    const wire = wireTasks.get(taskId);
+    const run = subagentRuns.get(taskId);
+    const terminalRun = run?.record;
+    let info = stored?.info !== undefined && isSettledTerminalTask(stored.info) ? stored.info
+      : wire !== undefined && isSettledTerminalTask(wire) ? wire
+        : stored?.info ?? wire!;
+    if (!isSettledTerminalTask(info) && terminalRun !== undefined) {
+      info = {
+        ...info,
+        status: terminalRun.type === 'subagent.completed' ? 'completed'
+          : terminalRun['error'] === 'terminated' ? 'killed' : 'failed',
+        endedAt: terminalRun.time ?? settleTime,
+        stopReason: terminalRun.type === 'subagent.failed' && terminalRun['error'] !== 'terminated' ? terminalRun['error'] : undefined,
+        cleanupPending: undefined,
+      };
+    }
+    const normalized = normalizePromotedTaskDocument(info, sourceRootAgentId, settleTime)!;
+    tasks.set(taskId, { info: normalized, output: stored?.output });
+    if (!terminatedTaskIds.has(taskId)) {
+      out.push({ type: 'task.terminated', info: normalized, time: normalized['endedAt'] as number });
+    }
+    const agentId = stringOf(normalized['agentId']);
+    if (normalized['kind'] === 'agent' && agentId !== undefined && !subagentRuns.has(taskId)) {
+      subagentRuns.set(taskId, { subagentId: agentId, taskId, state: 'running' });
+    }
   }
-  for (const run of subagentRuns.values()) {
-    if (run.state !== 'running') continue;
-    const failed: Record<string, unknown> = {
-      type: 'subagent.failed',
-      subagentId: run.subagentId,
-      error: 'terminated',
-      time: settleTime,
-    };
-    if (run.taskId !== undefined) failed['taskId'] = run.taskId;
-    out.push(failed as WireRecord);
+
+  const agentOutcomes = new Map<string, PromotedAgentOutcome>();
+  const runSettlements = new Map<string, WireRecord>();
+  for (const [runKey, run] of subagentRuns) {
+    const task = run.taskId === undefined ? undefined : tasks.get(run.taskId);
+    const info = task?.info;
+    const status = info?.['status'];
+    const completedAt = typeof info?.['endedAt'] === 'number' ? info['endedAt'] : run.record?.time ?? settleTime;
+    const completed = status === 'completed' || (info === undefined && run.record?.type === 'subagent.completed');
+    const resultSummary = completed ? (task?.output === undefined
+      ? stringOf(run.record?.['resultSummary']) ?? ''
+      : new TextDecoder().decode(task.output)) : undefined;
+    const error = completed ? undefined : status === 'killed' || (info === undefined && run.state === 'running')
+      ? 'terminated' : stringOf(info?.['stopReason']) ?? stringOf(run.record?.['error']) ?? String(status ?? 'terminated');
+    const settlement: WireRecord = completed
+      ? { ...run.record, type: 'subagent.completed', subagentId: run.subagentId, taskId: run.taskId, resultSummary, time: completedAt }
+      : { type: 'subagent.failed', subagentId: run.subagentId, taskId: run.taskId, error, time: completedAt };
+    runSettlements.set(runKey, settlement);
+    if ((agentOutcomes.get(run.subagentId)?.completedAt ?? 0) <= completedAt) {
+      agentOutcomes.set(run.subagentId, {
+        taskId: run.taskId,
+        status: completed ? 'completed' : error === 'terminated' ? 'cancelled' : 'failed',
+        completedAt, resultSummary, error,
+      });
+    }
+    if (run.state === 'running') out.push(settlement);
+  }
+  for (let index = 0; index < out.length; index += 1) {
+    const record = out[index]!;
+    if (record.type === 'task.terminated' && isPlainObject(record['info'])) {
+      const taskId = stringOf(record['info']['taskId']);
+      const task = taskId === undefined ? undefined : tasks.get(taskId);
+      if (task !== undefined) out[index] = { ...record, info: task.info };
+    } else if (record.type === 'subagent.completed' || record.type === 'subagent.failed') {
+      const runKey = stringOf(record['taskId']) ?? stringOf(record['subagentId']);
+      const settlement = runKey === undefined ? undefined : runSettlements.get(runKey);
+      if (settlement !== undefined) out[index] = settlement;
+    }
   }
   if (options.isDescendant === true) {
     for (const turnId of pendingAutonomousTurnIds) {
@@ -347,7 +432,7 @@ export function settlePromotedWireRecords(
     }
   }
 
-  return { records: out, knownTaskIds, settleTime };
+  return { records: out, tasks, agentOutcomes, settleTime };
 }
 
 /** Normalizes a persisted task JSON document for the promoted session so restored tasks stay terminal and quiet. */
@@ -368,6 +453,7 @@ export function normalizePromotedDescendantMeta(
     readonly sourceRootAgentId: string;
     readonly targetAgentHome: string;
     readonly settleTime: number;
+    readonly outcome?: PromotedAgentOutcome;
   },
 ): AgentMeta {
   const { agentMeta: meta, parentAgentId } = descendant;
@@ -400,9 +486,10 @@ export function normalizePromotedDescendantMeta(
     status,
     completedAt,
   };
+  if (options.outcome !== undefined && !isBranch) Object.assign(next, options.outcome);
   if (meta.forkedFrom === options.sourceRootAgentId) next['forkedFrom'] = 'main';
   if (Object.keys(labels).length > 0) next['labels'] = labels;
-  if (!preserveOutcome) {
+  if (!preserveOutcome && options.outcome === undefined) {
     delete next['resultSummary'];
     delete next['error'];
   }

@@ -238,7 +238,7 @@ describe('promoted subagent records', () => {
       },
     ], { sourceRootAgentId: 'agent-root', targetAgentId: 'main' });
 
-    expect(mainSettled.knownTaskIds).toEqual(new Set(['subagent-open-87654321']));
+    expect([...mainSettled.tasks.keys()]).toEqual(['subagent-open-87654321']);
     expect(mainSettled.records[0]).toMatchObject({
       type: 'subagent.spawned',
       parentAgentId: 'main',
@@ -274,7 +274,8 @@ describe('promoted subagent records', () => {
 
     const descendantFiltered = filterPromotedDescendantRecords([
       { type: 'profile.bind', profile: 'worker', time: 1 },
-      { type: 'executor.session.updated', sessionRef: { ref: { sessionId: 'remote-child' } }, time: 2 },
+      { type: 'executor.session.updated', executorId: 'example-acp', descriptorRevision: 'r1', sessionEpoch: 1,
+        sessionRef: { executorId: 'example-acp', version: 1, ref: { sessionId: 'remote-child' } }, time: 2 },
       { type: 'branch.base', version: 1, parentAgentId: 'agent-root', seed: 'verbatim', inheritedCount: 2, time: 3 },
       { type: 'turn.prompt', turnId: 0, parentReceiptManaged: false, time: 4 },
       {
@@ -285,7 +286,10 @@ describe('promoted subagent records', () => {
       { type: 'turn.ended', turnId: 0, reason: 'completed', time: 6 },
     ]);
     expect(descendantFiltered.some((record) => record.type === 'profile.bind')).toBe(true);
-    expect(descendantFiltered.some((record) => record.type === 'executor.session.updated')).toBe(false);
+    expect(descendantFiltered.find((record) => record.type === 'executor.session.updated')).toMatchObject({
+      sessionRef: { executorId: 'example-acp', version: 1, ref: { copiedIdentity: true } },
+    });
+    expect(JSON.stringify(descendantFiltered)).not.toContain('remote-child');
 
     const descendantSettled = settlePromotedWireRecords(descendantFiltered, {
       sourceRootAgentId: 'agent-root',
@@ -356,6 +360,81 @@ describe('promoted subagent records', () => {
         profileName: 'worker',
       },
     });
+  });
+
+  it.each(['disk', 'wire', 'subagent'] as const)('reconciles a %s-first terminal outcome across task documents, wire, and descendant metadata', (terminalSource) => {
+    const taskId = 'subagent-race-12345678';
+    const info = {
+      taskId, kind: 'agent', agentId: 'agent-child', ownerAgentId: 'agent-root',
+      description: 'Finish slice', status: 'running', startedAt: 10, endedAt: null,
+    };
+    const terminal = { ...info, status: 'completed', endedAt: 20 };
+    const records: WireRecord[] = [
+      { type: 'subagent.spawned', subagentId: 'agent-child', taskId, time: 10 },
+      { type: 'task.started', info, time: 10 },
+    ];
+    if (terminalSource === 'wire') records.push({ type: 'task.terminated', info: terminal, time: 20 });
+    if (terminalSource === 'subagent') records.push({ type: 'subagent.completed', subagentId: 'agent-child', taskId, resultSummary: 'Slice finished.', time: 20 });
+    const settled = settlePromotedWireRecords(records, {
+      sourceRootAgentId: 'agent-root', targetAgentId: 'main',
+      taskDocuments: new Map([[taskId, {
+        info: terminalSource === 'disk' ? terminal : info,
+        output: new TextEncoder().encode('Slice finished.'),
+      }]]),
+    });
+    const outcome = settled.tasks.get(taskId)!.info;
+    expect(outcome).toMatchObject({ status: 'completed', endedAt: 20, ownerAgentId: 'main', terminalNotificationSuppressed: true });
+    expect(settled.records.filter((record) => record.type === 'task.terminated')).toEqual([
+      expect.objectContaining({ info: outcome }),
+    ]);
+    expect(settled.records.filter((record) => record.type === 'subagent.completed' || record.type === 'subagent.failed')).toEqual([
+      expect.objectContaining({ type: 'subagent.completed', subagentId: 'agent-child', taskId, resultSummary: 'Slice finished.', time: 20 }),
+    ]);
+    expect(normalizePromotedDescendantMeta({
+      agentId: 'agent-child', parentAgentId: 'main', records: [], wasOpen: true,
+      agentMeta: { type: 'sub', taskId, status: 'failed', error: 'stale failure' },
+    }, {
+      sourceRootAgentId: 'agent-root', targetAgentHome: '/target/agents/agent-child', settleTime: 30,
+      outcome: settled.agentOutcomes.get('agent-child'),
+    })).toMatchObject({ taskId, status: 'completed', completedAt: 20, resultSummary: 'Slice finished.', error: undefined });
+  });
+
+  it.each(['completed', 'failed', 'killed', 'timed_out', 'lost'])('uses the committed %s task outcome over a conflicting wire outcome', (status) => {
+    const taskId = 'subagent-conflict-12345678';
+    const info = {
+      taskId, kind: 'agent', agentId: 'agent-child', ownerAgentId: 'agent-root',
+      description: 'Historical task', status: 'completed', startedAt: 10, endedAt: 20,
+    };
+    const settled = settlePromotedWireRecords([
+      { type: 'subagent.completed', subagentId: 'agent-child', taskId, resultSummary: 'Old result.', time: 20 },
+      { type: 'task.terminated', info, time: 20 },
+    ], {
+      sourceRootAgentId: 'agent-root', targetAgentId: 'main',
+      taskDocuments: new Map([[taskId, { info: { ...info, status, endedAt: 30, stopReason: 'Committed outcome' } }]]),
+    });
+    expect(settled.tasks.get(taskId)?.info).toMatchObject({ status, endedAt: 30 });
+    expect(settled.records.find((record) => record.type === 'task.terminated')?.['info']).toEqual(settled.tasks.get(taskId)?.info);
+    expect(settled.agentOutcomes.get('agent-child')).toMatchObject({
+      status: status === 'completed' ? 'completed' : status === 'killed' ? 'cancelled' : 'failed',
+      completedAt: 30,
+      error: status === 'completed' ? undefined : status === 'killed' ? 'terminated' : 'Committed outcome',
+    });
+  });
+
+  it('ends a delayed task start with the same reconciled terminal outcome', () => {
+    const taskId = 'subagent-late-12345678';
+    const info = {
+      taskId, kind: 'agent', agentId: 'agent-child', ownerAgentId: 'agent-root',
+      description: 'Historical task', status: 'completed', startedAt: 10, endedAt: 20,
+    };
+    const settled = settlePromotedWireRecords([
+      { type: 'task.terminated', info, time: 20 },
+      { type: 'task.started', info: { ...info, status: 'running', endedAt: null }, time: 30 },
+    ], { sourceRootAgentId: 'agent-root', targetAgentId: 'main' });
+    expect(settled.records.findLast((record) => record.type.startsWith('task.'))).toMatchObject({
+      type: 'task.terminated', info: { taskId, status: 'completed', endedAt: 20 },
+    });
+    expect(settled.tasks.get(taskId)?.info).toMatchObject({ status: 'completed', endedAt: 20 });
   });
 
   it('points blob references at the promoted main agent and collects foreign blobs and media ids', () => {

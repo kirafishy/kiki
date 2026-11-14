@@ -337,7 +337,8 @@ export class AcpAgentExecutorSession implements AgentExecutorSession {
     this.context.agent.accessor.get(IAgentExecutorRegistry).recordNegotiated?.(
       this.context.descriptor.id, this.context.descriptor.version, negotiated, this.context.descriptor.registryRevision,
     );
-    const handoff = (this.context.binding.execution === undefined || sessionOptions.allowRetiredSessionFallback === true) &&
+    const handoff = (prior.sessionRef?.ref['copiedIdentity'] === true ||
+        this.context.binding.execution === undefined || sessionOptions.allowRetiredSessionFallback === true) &&
         opened.mode === 'new' && prior.sessionRef !== undefined
       ? buildHandoff(this.#memory.get())
       : undefined;
@@ -1577,6 +1578,7 @@ function originalRemoteResumeFields(
   broken = false,
   reusable = agentExecutorBindingMatches(binding, state.bindingFingerprint),
 ): { readonly sessionRef: ExecutorSessionRefEnvelope | undefined; readonly requireResume: boolean } {
+  if (state.sessionRef?.ref['copiedIdentity'] === true) return { sessionRef: undefined, requireResume: false };
   const homeMatches = sameLaunchHome(state.sessionRef, descriptor);
   const changedInstance = state.executorId !== undefined && (state.executorId !== descriptor.id || state.descriptorRevision !== descriptor.revision);
   return {

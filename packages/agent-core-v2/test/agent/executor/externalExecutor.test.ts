@@ -22,6 +22,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ISessionMetadata } from '#/session/sessionMetadata/sessionMetadata';
 import { coldPromptFixture } from './coldPromptFixture';
 import { resolveExecutionBinding } from '#/agent/profile/executionBinding';
+import { filterPromotedDescendantRecords } from '#/workspace/sessionLifecycle/internal/promoteAgent';
 import { freezeBoundProfile } from '#/agent/profile/boundProfile';
 import { nativeTargets } from '@kiki/agent-profiles/nativeTarget';
 import { attachExternalMailboxHarness } from './mailboxHarness';
@@ -2702,6 +2703,27 @@ describe('ACP external executor', () => {
       ),
     ).rejects.toThrow();
     expect(harness.starts).toHaveLength(0);
+  });
+
+  it('seeds a promoted ACP descendant without requesting the source remote session', async () => {
+    const harness = createHarness({ mode: 'new', history: [
+      { role: 'user', content: [{ type: 'text', text: 'Record the decision.' }], toolCalls: [] },
+      { role: 'assistant', content: [{ type: 'text', text: 'Preserved architectural decision.' }], toolCalls: [] },
+    ] });
+    const execution = resolveExecutionBinding({ executor: 'example-acp' }, undefined, undefined, undefined);
+    const copied = filterPromotedDescendantRecords([{
+      type: 'executor.session.updated', executionGeneration: execution.generation,
+      executorId: 'example-acp', descriptorRevision: 'r1', sessionEpoch: 1,
+      sessionRef: { executorId: 'example-acp', version: 1, ref: { sessionId: 'source-session' } },
+    }]);
+    for (const record of copied) await harness.dispatcher.dispatch(new ExecutorSessionUpdated(ExecutorSessionUpdated.schema.parse(record)));
+    const session = harness.createSession({ ...harness.executorContext, binding: { ...harness.executorContext.binding, execution } });
+    try {
+      await (await session.run({ kind: 'prompt', prompt: 'Continue the decision.' }, { signal: new AbortController().signal })).completion;
+      expect(harness.opens[0]).toMatchObject({ sessionRef: undefined, requireResume: false });
+      expect(harness.starts[0]?.prompt).toContain('Preserved architectural decision.');
+      expect(harness.events.find((event) => event instanceof ExecutorTurnMetadata)).toMatchObject({ resumeMode: 'handoff' });
+    } finally { await session.shutdown(); }
   });
 
   it('builds deterministic bounded handoff for new-session fallback', async () => {

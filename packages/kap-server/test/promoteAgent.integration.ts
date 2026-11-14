@@ -21,16 +21,18 @@ import { BranchBase, ContextAppendMessage } from '@kiki/agent-core-v2/agent/cont
 import { TurnEnded, TurnPrompt, turnKey } from '@kiki/agent-core-v2/agent/loop/turnOps';
 import { SESSION_MEDIA_DIR } from '@kiki/agent-core-v2/agent/media/mediaRef';
 import { PermissionRecordApprovalResult, permissionRulesKey } from '@kiki/agent-core-v2/agent/permissionRules/permissionRulesOps';
-import { TaskStarted, TaskTerminated } from '@kiki/agent-core-v2/agent/task/taskOps';
+import { TaskStarted } from '@kiki/agent-core-v2/agent/task/taskOps';
 import { IAgentListTool } from '@kiki/agent-core-v2/agent/tools/agent-list/agent-list';
 import { AgentBranchSealed } from '@kiki/agent-core-v2/features/btw/branchOps';
 import { IAgentLifecycleService } from '@kiki/agent-core-v2/session/agentLifecycle/agentLifecycle';
-import { SubagentCompleted, SubagentSpawned } from '@kiki/agent-core-v2/session/subagent/mirrorAgentRun';
+import { SubagentSpawned } from '@kiki/agent-core-v2/session/subagent/mirrorAgentRun';
 import { autonomousReceiptsKey } from '@kiki/agent-core-v2/session/subagent/autonomousReceiptOps';
 import { ToolsUpdateStore, todoKey } from '@kiki/agent-core-v2/session/todo/todoOps';
 import { ISessionMetadata } from '@kiki/agent-core-v2/session/sessionMetadata/sessionMetadata';
 import { IEventDispatcher } from '@kiki/agent-core-v2/state/eventDispatcher';
 import { IAppendLogStore } from '@kiki/agent-core-v2/persistence/interface/appendLogStore';
+import { IAtomicDocumentStore } from '@kiki/agent-core-v2/persistence/interface/atomicDocumentStore';
+import { AgentTaskPersistence } from '@kiki/agent-core-v2/agent/task/persist';
 import { IFileSystemStorageService } from '@kiki/agent-core-v2/persistence/interface/storage';
 import type { WireRecord } from '@kiki/agent-core-v2/wire/record';
 import { startServer } from '../src/start';
@@ -93,7 +95,10 @@ it('promotes an ephemeral running subagent through the real route without copyin
       storage.write(sourceContext.scope('agents/main/blobs'), sharedHash, new Uint8Array([4, 5, 6]), { atomic: true }),
       storage.write(childContext.scope('tool-results'), 'result.txt', new TextEncoder().encode('saved tool output'), { atomic: true }),
       storage.write(childContext.scope(`tasks/${taskId}`), 'output.log', new TextEncoder().encode('full bash output'), { atomic: true }),
-      storage.write(childContext.scope(`tasks/${taskId}`), `${taskId}.json`, new TextEncoder().encode('{"status":"completed"}'), { atomic: true }),
+      storage.write(childContext.scope('tasks'), `${taskId}.json`, new TextEncoder().encode(JSON.stringify({
+        taskId, kind: 'process', ownerAgentId: 'agent-research', description: 'Saved command',
+        command: 'fixture', pid: 0, exitCode: 0, startedAt: 1, endedAt: 2, status: 'completed',
+      })), { atomic: true }),
       storage.write(sourceContext.scope(SESSION_MEDIA_DIR), 'f_visual1.png', new Uint8Array([7, 8, 9]), { atomic: true }),
       storage.write(sourceContext.scope(SESSION_MEDIA_DIR), 'meta/f_visual1.json', new TextEncoder().encode(JSON.stringify({ name: 'evidence.png', mime: 'image/png' })), { atomic: true }),
     ]);
@@ -179,7 +184,8 @@ it('promotes an ephemeral running subagent through the real route without copyin
     expect(await storage.read(targetContext.scope('agents/main/tool-results'), 'result.txt')).toEqual(Buffer.from('saved tool output'));
     expect(await storage.read(targetContext.scope(`agents/main/tasks/${taskId}`), 'output.log')).toEqual(Buffer.from('full bash output'));
     expect(await storage.read(targetContext.scope(`agents/main/tasks/${taskId}`), `${taskId}.json`)).toBeUndefined();
-    expect(await storage.read(childContext.scope(`tasks/${taskId}`), `${taskId}.json`)).toBeDefined();
+    expect(await storage.read(targetContext.scope('agents/main/tasks'), `${taskId}.json`)).toBeDefined();
+    expect(await storage.read(childContext.scope('tasks'), `${taskId}.json`)).toBeDefined();
     expect(await storage.read(targetContext.scope(SESSION_MEDIA_DIR), 'f_visual1.png')).toEqual(Buffer.from([7, 8, 9]));
     expect(await storage.read(targetContext.scope(SESSION_MEDIA_DIR), 'meta/f_visual1.json')).toBeDefined();
     await expect(client.session(source.id).commands.promoteAgent('missing-agent')).rejects.toMatchObject({ code: 40401 });
@@ -489,12 +495,6 @@ it('preserves settled subagent cards, tasks, and full child/grandchild/branch su
       endedAt: 200,
     };
     await rootDispatcher.dispatch(new TaskStarted({ info: { ...doneTaskInfo, status: 'running', endedAt: null } }));
-    await rootDispatcher.dispatch(new SubagentCompleted({
-      subagentId: 'agent-child',
-      resultSummary: 'Child slice completed.',
-      taskId: doneTaskId,
-    }));
-    await rootDispatcher.dispatch(new TaskTerminated({ info: doneTaskInfo, outputTail: 'Child slice completed.' }));
 
     const openTaskInfo = {
       taskId: openTaskId,
@@ -531,6 +531,31 @@ it('preserves settled subagent cards, tasks, and full child/grandchild/branch su
       storage.write(rootScope.scope('tasks'), `${openTaskId}.json`, new TextEncoder().encode(JSON.stringify(openTaskInfo)), { atomic: true }),
       storage.write(rootScope.scope(`tasks/${openTaskId}`), 'output.log', new TextEncoder().encode('Partial probe log'), { atomic: true }),
     ]);
+
+    const diskOnlyTaskId = 'agent-receipt-11223344';
+    const childScope = childSub.accessor.get(IAgentScopeContext);
+    const childPersistence = new AgentTaskPersistence(
+      join(source.accessor.get(ISessionContext).sessionDir, 'agents', 'agent-child'), childScope.scope(),
+      server.core.accessor.get(IAtomicDocumentStore), storage,
+    );
+    await childPersistence.commitTerminalTask({
+      ...doneTaskInfo, taskId: diskOnlyTaskId, agentId: 'agent-grandchild', ownerAgentId: 'agent-child',
+      description: 'Autonomous receipt saved while parent was cold', startedAt: 201, endedAt: 202,
+    }, 'Grandchild autonomous receipt.');
+    await storage.write(childScope.scope('tasks/orphan-output-11223344'), 'output.log', Buffer.from('orphan output'), { atomic: true });
+    await storage.write(childScope.scope('tasks'), 'foreign-owner-11223344.json', Buffer.from(JSON.stringify({
+      ...doneTaskInfo, taskId: 'foreign-owner-11223344', ownerAgentId: 'agent-sibling',
+    })), { atomic: true });
+    await storage.write(childScope.scope('tasks/foreign-owner-11223344'), 'output.log', Buffer.from('foreign output'), { atomic: true });
+
+    const diskFirstTaskId = 'bash-diskfirst-11223344';
+    const diskFirstInfo = {
+      taskId: diskFirstTaskId, kind: 'process' as const, ownerAgentId: 'agent-research', description: 'Disk commit before wire termination',
+      command: 'fixture', pid: 0, exitCode: 0, status: 'completed' as const, startedAt: 300, endedAt: 400,
+    };
+    await rootDispatcher.dispatch(new TaskStarted({ info: { ...diskFirstInfo, status: 'running', endedAt: null } }));
+    await rootDispatcher.flush();
+    await storage.write(rootScope.scope('tasks'), `${diskFirstTaskId}.json`, Buffer.from(JSON.stringify(diskFirstInfo)), { atomic: true });
 
     const inflightSubmitted = await inflightSub.accessor.get(IAgentPromptService).enqueue({
       id: 'inflight-prompt',
@@ -591,6 +616,31 @@ it('preserves settled subagent cards, tasks, and full child/grandchild/branch su
       status: 'killed',
       terminalNotificationSuppressed: true,
     });
+
+    expect(allTasks.get(diskFirstTaskId)).toMatchObject({ status: 'completed', endedAt: 400, ownerAgentId: 'main' });
+    const promotedWire: WireRecord[] = [];
+    for await (const record of server.core.accessor.get(IAppendLogStore).read<WireRecord>(targetContext.scope('agents/main'), 'wire.jsonl')) promotedWire.push(record);
+    expect(promotedWire.filter((record) => record.type === 'task.terminated')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ info: expect.objectContaining({ taskId: doneTaskId, status: 'completed' }) }),
+      expect.objectContaining({ info: expect.objectContaining({ taskId: diskFirstTaskId, status: 'completed', endedAt: 400 }) }),
+    ]));
+    expect(promotedWire).toContainEqual(expect.objectContaining({ type: 'subagent.completed', subagentId: 'agent-child', taskId: doneTaskId, resultSummary: 'Child slice completed.' }));
+    expect((await target.accessor.get(ISessionMetadata).read()).agents?.['agent-child']).toMatchObject({
+      taskId: doneTaskId, status: 'completed', resultSummary: 'Child slice completed.',
+    });
+    const promotedChildPersistence = new AgentTaskPersistence(
+      join(targetContext.sessionDir, 'agents', 'agent-child'), targetContext.scope('agents/agent-child'),
+      server.core.accessor.get(IAtomicDocumentStore), storage,
+    );
+    expect(await promotedChildPersistence.readTask(diskOnlyTaskId)).toMatchObject({
+      taskId: diskOnlyTaskId, status: 'completed', ownerAgentId: 'agent-child', receiptVerification: 'verified',
+      terminalNotificationSuppressed: true,
+    });
+    expect(await promotedChildPersistence.readTaskOutputPage(diskOnlyTaskId, 0, 1024)).toMatchObject({ text: 'Grandchild autonomous receipt.' });
+    expect(await storage.read(targetContext.scope('agents/agent-child/tasks/orphan-output-11223344'), 'output.log')).toBeUndefined();
+    expect(await storage.read(targetContext.scope('agents/agent-child/tasks/foreign-owner-11223344'), 'output.log')).toBeUndefined();
+    expect(await storage.read(targetContext.scope('agents/agent-child/tasks'), 'foreign-owner-11223344.json')).toBeUndefined();
+    expect(await childPersistence.readTask(diskOnlyTaskId)).toMatchObject({ ownerAgentId: 'agent-child', status: 'completed', receiptVerification: 'verified' });
 
     const liveSnapshot = await client.session(promoted.id).view.snapshot();
     const rosterById = new Map((liveSnapshot.subagents ?? []).map((row) => [row.agent_id ?? row.id, row]));
