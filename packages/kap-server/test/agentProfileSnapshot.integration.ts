@@ -4,12 +4,16 @@ import { join } from 'node:path';
 
 import {
   AGENT_WIRE_RECORD_KEY,
+  ensureMainAgent,
   IAgentLifecycleService,
+  IAgentMcpService,
   IAgentProfileRegistry,
   IAgentProfileService,
   IAppendLogStore,
   IConfigService,
   IWorkspaceInstanceManager,
+  IWorkspacePersistence,
+  IWorkspaceService,
   IFileSystemStorageService,
   ISessionAgentProfileCatalog,
   ISessionContext,
@@ -441,6 +445,138 @@ describe('disposed agent capability snapshots', () => {
     expect(data.tools?.some((tool) => tool.policy_allowed === true)).toBe(true);
     expect(data.skills).toBeDefined();
     expect(data.targets).toBeDefined();
+    expect(manager.get(sessionId)).toBeUndefined();
+  });
+
+  it('applies saved session MCP overrides to stopped and cold capability reads', async () => {
+    await writeStubConfig(home);
+    await writeFile(
+      join(home, 'mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          example: { command: 'example-mcp-server' },
+          standby: { command: 'standby-mcp-server', enabled: false },
+        },
+      }),
+    );
+    await start();
+    const registration = server!.core.accessor.get(IAgentProfileRegistry).register({
+      sourceId: 'snapshot-mcp-override-fixture',
+      priority: 40,
+      contribution: {
+        profiles: [
+          normalizeAgentProfile({
+            name: 'snapshot-mcp-owner',
+            modelAlias: 'stub',
+            tools: ['Read', 'mcp__*'],
+            canSpawnSubagents: false,
+            systemPrompt: () => '',
+          }),
+        ],
+      },
+    });
+    try {
+      const sessionId = await createSession();
+      const manager = server!.core.accessor.get(ISessionManager);
+      const session = manager.get(sessionId)!;
+      const main = await ensureMainAgent(session);
+      const lifecycle = session.accessor.get(IAgentLifecycleService);
+      await lifecycle.create({
+        agentId: 'snapshot-mcp-owner',
+        delegator: { kind: 'agent', agentId: 'main' },
+        binding: { profile: 'snapshot-mcp-owner', model: 'stub' },
+      });
+      await lifecycle.remove('snapshot-mcp-owner');
+      const workspaceId = session.accessor.get(ISessionContext).workspaceId;
+      const scope = agentScopeOf(
+        sessionScopeOf(workspacePersistenceScope('sessions', workspaceId), sessionId),
+        'snapshot-mcp-owner',
+      );
+      const log = server!.core.accessor.get(IAppendLogStore);
+      log.append(
+        scope,
+        AGENT_WIRE_RECORD_KEY,
+        new McpToolsDiscovered({
+          serverName: 'example',
+          hash: 'example-discovery',
+          tools: [{ name: 'lookup', description: 'Look up an item', inputSchema: { type: 'object' } }],
+          enabledNames: ['lookup'],
+        }).serialize(),
+      );
+      log.append(
+        scope,
+        AGENT_WIRE_RECORD_KEY,
+        new McpToolsDiscovered({
+          serverName: 'standby',
+          hash: 'standby-discovery',
+          tools: [{ name: 'ping', description: 'Ping server', inputSchema: { type: 'object' } }],
+          enabledNames: ['ping'],
+        }).serialize(),
+      );
+      await log.flush(scope, AGENT_WIRE_RECORD_KEY);
+      const mcp = main.accessor.get(IAgentMcpService);
+      await mcp.setMcpSessionOverride({ locator: { source: 'global', name: 'example' }, override: 'off' });
+      await mcp.setMcpSessionOverride({ locator: { source: 'global', name: 'standby' }, override: 'on' });
+
+      const verify = (data: AgentCapabilitiesResponse) => {
+        expect(data.tools?.find((tool) => tool.name === 'mcp__example__lookup')).toMatchObject({
+          source: 'mcp',
+          state: 'disabled',
+          policy_allowed: false,
+          unavailable_reason_code: 'tool_policy_disabled',
+        });
+        expect(data.tools?.find((tool) => tool.name === 'mcp__standby__ping')).toMatchObject({
+          source: 'mcp',
+          state: 'unknown',
+          policy_allowed: true,
+          unavailable_reason_code: 'snapshot_inventory_only',
+        });
+      };
+
+      verify(await readCapabilities(sessionId, 'snapshot-mcp-owner'));
+      await manager.close(sessionId);
+      await server!.core.accessor.get(IWorkspaceInstanceManager).close(workspaceId);
+      const connect = vi.spyOn(McpConnectionManager.prototype, 'connectAll');
+      verify(await readCapabilities(sessionId, 'snapshot-mcp-owner'));
+      expect(connect).not.toHaveBeenCalled();
+      expect(manager.get(sessionId)).toBeUndefined();
+    } finally {
+      await registration.dispose();
+    }
+  });
+
+  it('resolves cold capability workspace from indexed session summary without mutating workspace registrations', async () => {
+    await writeStubConfig(home);
+    const projectDir = join(home, 'unregistered-project');
+    await mkdir(join(projectDir, '.agents', 'skills', 'project-local-skill'), { recursive: true });
+    await writeFile(
+      join(projectDir, '.agents', 'skills', 'project-local-skill', 'SKILL.md'),
+      '---\nname: project-local-skill\ndescription: Project local skill\n---\nUse project skill.',
+    );
+    await start();
+    const response = await authedFetch(server!, base, '/api/sessions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ metadata: { cwd: projectDir }, agent_config: { profile: 'agent', model: 'stub' } }),
+    });
+    const created = await response.json() as Envelope<{ id: string }>;
+    expect(created.code).toBe(0);
+    const sessionId = created.data.id;
+    const manager = server!.core.accessor.get(ISessionManager);
+    const workspaceId = manager.get(sessionId)!.accessor.get(ISessionContext).workspaceId;
+    await manager.close(sessionId);
+    await server!.core.accessor.get(IWorkspaceInstanceManager).close(workspaceId);
+    const workspacePersistence = server!.core.accessor.get(IWorkspacePersistence);
+    await workspacePersistence.save({ workspaces: [], deletedIds: [] });
+    const saveSpy = vi.spyOn(workspacePersistence, 'save');
+    const getSpy = vi.spyOn(server!.core.accessor.get(IWorkspaceService), 'get');
+
+    const data = await readCapabilities(sessionId, 'main');
+    expect(data).toMatchObject({ live: false, available: true, profile: { name: 'agent', model: 'stub' } });
+    expect(data.skills?.some((skill) => skill.name === 'project-local-skill')).toBe(true);
+    expect(getSpy).not.toHaveBeenCalled();
+    expect(saveSpy).not.toHaveBeenCalled();
+    expect((await workspacePersistence.load())?.workspaces ?? []).toEqual([]);
     expect(manager.get(sessionId)).toBeUndefined();
   });
 

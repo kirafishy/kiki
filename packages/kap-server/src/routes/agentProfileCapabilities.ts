@@ -12,6 +12,7 @@ import {
   IHostEnvironment,
   IInstantiationService,
   ILogService,
+  IMcpRegistryService,
   IModelCatalog,
   IModelService,
   IProtocolAdapterRegistry,
@@ -25,6 +26,8 @@ import {
   ISubagentTool,
   IWorkspaceInstanceManager,
   IWorkspaceService,
+  readPersistedSessionMcpToolPredicate,
+  readUnstartedSessionMcpToolPredicate,
   ServiceCollection,
   SessionAgentProfileCatalogService,
   type Scope,
@@ -231,16 +234,26 @@ export async function acquireWorkspaceProfileCatalog(
   }
 }
 
-async function acquireSavedWorkspaceProfileCatalog(core: Scope, workspaceId: string) {
-  const workspace = await core.accessor.get(IWorkspaceService).get(workspaceId);
-  if (workspace === undefined) return undefined;
-  const preview = createUnscopedAgentProfileCatalog(core.accessor.get(IInstantiationService), workspace.root, workspaceId);
+async function acquireSavedWorkspaceProfileCatalog(
+  core: Scope,
+  workspaceId: string,
+  summary: { readonly cwd?: string; readonly worktree?: { readonly sourceRoot: string } } | undefined,
+  meta: { readonly cwd?: string; readonly worktree?: { readonly sourceRoot: string } } | undefined,
+) {
+  const indexedRoot = summary?.worktree?.sourceRoot ?? meta?.worktree?.sourceRoot ?? summary?.cwd ?? meta?.cwd;
+  const registered = indexedRoot === undefined
+    ? await core.accessor.get(IWorkspaceService).findRegisteredById(workspaceId)
+    : undefined;
+  const root = indexedRoot ?? registered?.root;
+  if (root === undefined) return undefined;
+  const cwd = summary?.cwd ?? meta?.cwd ?? root;
+  const preview = createUnscopedAgentProfileCatalog(core.accessor.get(IInstantiationService), root, workspaceId);
   try {
     for (const entry of core.accessor.get(IAgentProfileRegistry).entries()) {
       if (entry.workspaceKey === undefined) preview.registry.register(entry);
     }
     await Promise.all([preview.catalog.ready, preview.skills!.ready]);
-    return { catalog: preview.catalog, skills: preview.skills!.catalog, dispose: preview.dispose };
+    return { cwd, catalog: preview.catalog, skills: preview.skills!.catalog, dispose: preview.dispose };
   } catch (error) {
     await preview.dispose();
     throw error;
@@ -362,7 +375,7 @@ async function readAgentCapabilities(
         unavailable_reason_code: 'persisted_metadata_unavailable', targets: [],
         metrics: persisted,
       };
-      const workspace = session === undefined ? await acquireSavedWorkspaceProfileCatalog(core, workspaceId) : undefined;
+      const workspace = session === undefined ? await acquireSavedWorkspaceProfileCatalog(core, workspaceId, summary, meta) : undefined;
       if (session === undefined && workspace === undefined) return 'workspace-not-found';
       try {
         const catalog = session === undefined ? workspace!.catalog : session.accessor.get(ISessionAgentProfileCatalog);
@@ -387,6 +400,16 @@ async function readAgentCapabilities(
         const savedPolicy = session === undefined ? await core.accessor.get(IAtomicDocumentStore).get<{ disabledTools: readonly string[] }>(
           `sessions/${workspaceId}/${query.session_id}/tool-policy`, 'state.json',
         ) : undefined;
+        const mcpToolAllowed = (snapshot.mcpTools?.length ?? 0) === 0
+          ? undefined
+          : session === undefined
+            ? await readPersistedSessionMcpToolPredicate(
+                query.session_id,
+                workspace!.cwd,
+                core.accessor.get(IMcpRegistryService),
+                core.accessor.get(IAtomicDocumentStore),
+              )
+            : await readUnstartedSessionMcpToolPredicate(session);
         const panel = await snapshotPanelCapabilities(session ?? core, snapshot, {
           profile: resolution.profile,
           sourceId: resolution.sourceId,
@@ -394,6 +417,7 @@ async function readAgentCapabilities(
           skills: (skillCatalog?.catalog ?? workspace!.skills).listSkills(),
           workspaceDisabledTools: session?.accessor.get(ISessionToolPolicyGate).disabledTools,
           sessionDisabledTools: sessionPolicy?.disabledTools() ?? savedPolicy?.disabledTools,
+          mcpToolAllowed,
         });
         const persistedBinding = snapshot.source === 'wire';
         const input: SubagentCapabilityCatalog = {

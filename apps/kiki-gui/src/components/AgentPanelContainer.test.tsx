@@ -741,6 +741,43 @@ it('shows canonical session tokens as an incomplete tree subtotal while per-agen
   expect(element.querySelector('[data-metrics-counting]')).not.toBeNull();
 });
 
+it.each(['default', 'cockpit'] as const)('keeps canonical session total in %s mode when a partial per-agent subset arrives and updates when the tree exceeds or covers it', async (overviewMode) => {
+  const settles: Array<(value: unknown) => void> = [];
+  getAgentCapabilities.mockImplementation((query: { metrics_settle?: boolean }) => query.metrics_settle
+    ? new Promise((resolve) => { settles.push(resolve); })
+    : Promise.resolve({ metrics: { main: countedMetrics(100, 0.01), child: coldMetrics } }));
+  harness.sessionUsageAccounting.mockResolvedValue({
+    version: 2,
+    subject: { session_id: 'session', scope: 'session' },
+    covered_at: 1,
+    complete: true,
+    freshness: 'current',
+    tokens: { input_other: 10_000, output: 2_000, input_cache_read: 3_000, input_cache_creation: 1_000 },
+    tokens_unknown: false,
+    cost_usd_estimated: 0.08,
+    cost_unknown: false,
+  });
+  await render('main', { part: 'overview', overviewMode, forest: forestOf(['main', 'child']) });
+  if (overviewMode === 'default') {
+    await act(async () => { element.querySelector<HTMLButtonElement>('[data-usage-scope="tree"]')?.click(); });
+  }
+  await flushRender();
+  const tokenSelector = overviewMode === 'default' ? '[data-overview-fact="tokens"]' : '[data-cockpit-fact="tokens"]';
+  expect(element.querySelector(tokenSelector)?.textContent).toContain('16k');
+  expect(element.querySelector(tokenSelector)?.textContent).not.toContain('100');
+  expect(element.querySelector('[data-metrics-counting]')).not.toBeNull();
+  harness.agents['child'] = viewState({ usage: { total: { inputOther: 18_000, output: 900, inputCacheRead: 0, inputCacheCreation: 0 } } });
+  await act(async () => { harness.emit(); });
+  await flushRender();
+  expect(element.querySelector(tokenSelector)?.textContent).toContain('19k');
+  await act(async () => {
+    settles.at(-1)?.({ metrics: { child: countedMetrics(17_900, 0.06) } });
+  });
+  await flushRender();
+  expect(element.querySelector(tokenSelector)?.textContent).toContain('18k');
+  expect(element.querySelector('[data-metrics-counting]')).toBeNull();
+});
+
 it('paints the overview before a cold settle and then shows the completed tokens', async () => {
   let resolveSettle: ((value: unknown) => void) | undefined;
   getAgentCapabilities.mockImplementation((query: { metrics_settle?: boolean; agent_id: string }) => {

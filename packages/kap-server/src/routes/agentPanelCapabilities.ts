@@ -15,6 +15,7 @@ import {
   type PluginToolRegistration,
   type ProfileData,
   type Scope,
+  type SessionMcpToolPredicate,
 } from '@kiki/agent-core-v2';
 import { spawnConstraintOrigin } from '@kiki/agent-core-v2/app/agentProfileCatalog/applySubagentLease';
 import type { SkillDefinition } from '@kiki/agent-core-v2/app/skillCatalog/types';
@@ -113,6 +114,7 @@ export async function snapshotPanelCapabilities(
     readonly skills: readonly SkillDefinition[];
     readonly workspaceDisabledTools?: readonly string[];
     readonly sessionDisabledTools?: readonly string[];
+    readonly mcpToolAllowed?: SessionMcpToolPredicate;
   },
 ): Promise<Pick<AgentCapabilitiesProducerResponse, 'profile' | 'tools' | 'skills'>> {
   const definition = resolution.profile;
@@ -189,7 +191,10 @@ export async function snapshotPanelCapabilities(
     for (const tool of server.tools) {
       const name = qualifyMcpToolName(server.serverName, tool.name);
       if (server.collisions?.some((collision) => collision.toolName === tool.name) === true) continue;
-      const active = server.enabledNames.includes(tool.name) && isToolActiveComposed(policy, name, 'mcp');
+      const mcpAllowed = inventory.mcpToolAllowed === undefined
+        ? server.enabledNames.includes(tool.name)
+        : inventory.mcpToolAllowed(server.serverName, tool.name, server.enabledNames);
+      const active = mcpAllowed && isToolActiveComposed(policy, name, 'mcp');
       tools.push({
         name, description: tool.description, source: 'mcp', category: 'mcp',
         state: active ? 'unknown' : 'disabled', policy_allowed: active,

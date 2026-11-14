@@ -665,6 +665,30 @@ describe('WorkspaceService (file-backed)', () => {
     expect(list[0]?.root).toBe(lowerRoot);
   });
 
+  it('findRegisteredById reads the catalog without triggering legacy discovery or saving', async () => {
+    const registeredRoot = '/tmp/registered';
+    const registeredId = encodeWorkDirKey(registeredRoot);
+    const unmergedRoot = '/tmp/unmerged';
+    const unmergedId = encodeWorkDirKey(unmergedRoot);
+    await writeWorkspacesJson({
+      [registeredId]: {
+        root: registeredRoot,
+        name: 'registered',
+        created_at: '2026-01-01T00:00:00.000Z',
+        last_opened_at: '2026-01-01T00:00:00.000Z',
+      },
+    });
+    await seedSessionIndex([
+      { sessionId: 's-unmerged', sessionDir: `sessions/${unmergedId}/s-unmerged`, workDir: unmergedRoot },
+    ]);
+    const before = await fsp.readFile(join(homeDir, 'workspaces.json'), 'utf8');
+
+    const registry = build();
+    expect((await registry.findRegisteredById(registeredId))?.root).toBe(registeredRoot);
+    expect(await registry.findRegisteredById(unmergedId)).toBeUndefined();
+    expect(await fsp.readFile(join(homeDir, 'workspaces.json'), 'utf8')).toBe(before);
+  });
+
   it('rebuild folds session-index workDir variants into one workspace', async () => {
     const firstSeen = '//Host/Share/Proj';
     await seedSessionIndex([

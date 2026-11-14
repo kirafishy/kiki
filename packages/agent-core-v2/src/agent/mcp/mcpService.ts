@@ -836,24 +836,64 @@ export class AgentMcpService extends Service implements IAgentMcpService {
   }
 }
 
-export async function readPersistedSessionMcpCapabilities(
-  sessionId: string,
-  cwd: string,
-  registry: IMcpRegistryService,
-  docs: IAtomicDocumentStore,
-): Promise<readonly McpSessionCapability[]> {
-  const overrides = readSessionOverrides(await docs.get<unknown>(SESSION_MCP_OVERRIDES_SCOPE, sessionId));
-  const catalog = await registry.list({ cwd });
-  const effective = effectiveEntries(catalog);
-  return catalog.map((entry) => projectSessionMcpCapability(
-    entry,
-    effective.get(entry.name),
-    overrides[mcpLocatorKey(toMcpLocator(entry))] ?? 'inherit',
-    undefined,
-  ));
+export type SessionMcpToolPredicate = (
+  serverName: string,
+  toolName: string,
+  discoveredEnabledNames: readonly string[],
+) => boolean;
+
+export function createSessionMcpToolPredicate(
+  capabilities: readonly McpSessionCapability[],
+  overrides?: ReadonlyMap<string, McpSessionOverrideValue>,
+): SessionMcpToolPredicate {
+  const known = new Set<string>();
+  const effective = new Map<string, McpSessionCapability>();
+  for (const capability of capabilities) {
+    known.add(capability.runtimeName);
+    const current = effective.get(capability.runtimeName);
+    if (capability.origin === 'global') {
+      effective.set(capability.runtimeName, capability);
+      continue;
+    }
+    if (capability.config.enabled === false || current !== undefined) continue;
+    effective.set(capability.runtimeName, capability);
+  }
+  return (serverName, toolName, discoveredEnabledNames) => {
+    if (!known.has(serverName)) {
+      if (overrides?.get(`global:${encodeURIComponent(serverName)}`) === 'off') return false;
+      return discoveredEnabledNames.includes(toolName);
+    }
+    const selected = effective.get(serverName);
+    if (selected === undefined || selected.connection === 'disabled') return false;
+    if (selected.config.enabledTools !== undefined && !selected.config.enabledTools.includes(toolName)) return false;
+    if (selected.config.disabledTools !== undefined && selected.config.disabledTools.includes(toolName)) return false;
+    return discoveredEnabledNames.includes(toolName);
+  };
 }
 
-export async function readUnstartedSessionMcpCapabilities(session: ISessionScopeHandle): Promise<readonly McpSessionCapability[]> {
+async function loadPersistedSessionMcpState(
+  sessionId: string,
+  cwd: string,
+  registry: Pick<IMcpRegistryService, 'list'>,
+  docs: Pick<IAtomicDocumentStore, 'get'>,
+): Promise<{ readonly capabilities: readonly McpSessionCapability[]; readonly overrides: ReadonlyMap<string, StoredSessionOverride> }> {
+  const rawOverrides = readSessionOverrides(await docs.get<unknown>(SESSION_MCP_OVERRIDES_SCOPE, sessionId));
+  const catalog = await registry.list({ cwd });
+  const effective = effectiveEntries(catalog);
+  return {
+    capabilities: catalog.map((entry) => projectSessionMcpCapability(
+      entry,
+      effective.get(entry.name),
+      rawOverrides[mcpLocatorKey(toMcpLocator(entry))] ?? 'inherit',
+      undefined,
+    )),
+    overrides: new Map(Object.entries(rawOverrides)),
+  };
+}
+
+async function loadUnstartedSessionMcpState(
+  session: ISessionScopeHandle,
+): Promise<{ readonly capabilities: readonly McpSessionCapability[]; readonly overrides: ReadonlyMap<string, StoredSessionOverride> }> {
   const context = session.accessor.get(ISessionContext);
   const handle = session.accessor.get(ISessionMcpHandle);
   const registry = session.accessor.get(IMcpRegistryService);
@@ -864,11 +904,42 @@ export async function readUnstartedSessionMcpCapabilities(session: ISessionScope
     : handle.selection.overrides;
   const catalog = await registry.list({ cwd: context.cwd });
   const effective = effectiveEntries(catalog);
-  return catalog.map((entry) => {
-    const selected = effective.get(entry.name);
-    const managerEntry = sameRegistryEntry(entry, selected) ? handle.connectionManager.get(entry.name) : undefined;
-    return projectSessionMcpCapability(entry, selected, overrides.get(mcpLocatorKey(toMcpLocator(entry))) ?? 'inherit', managerEntry);
-  });
+  return {
+    capabilities: catalog.map((entry) => {
+      const selected = effective.get(entry.name);
+      const managerEntry = sameRegistryEntry(entry, selected) ? handle.connectionManager.get(entry.name) : undefined;
+      return projectSessionMcpCapability(entry, selected, overrides.get(mcpLocatorKey(toMcpLocator(entry))) ?? 'inherit', managerEntry);
+    }),
+    overrides,
+  };
+}
+
+export async function readPersistedSessionMcpCapabilities(
+  sessionId: string,
+  cwd: string,
+  registry: IMcpRegistryService,
+  docs: IAtomicDocumentStore,
+): Promise<readonly McpSessionCapability[]> {
+  return (await loadPersistedSessionMcpState(sessionId, cwd, registry, docs)).capabilities;
+}
+
+export async function readPersistedSessionMcpToolPredicate(
+  sessionId: string,
+  cwd: string,
+  registry: Pick<IMcpRegistryService, 'list'>,
+  docs: Pick<IAtomicDocumentStore, 'get'>,
+): Promise<SessionMcpToolPredicate> {
+  const state = await loadPersistedSessionMcpState(sessionId, cwd, registry, docs);
+  return createSessionMcpToolPredicate(state.capabilities, state.overrides);
+}
+
+export async function readUnstartedSessionMcpCapabilities(session: ISessionScopeHandle): Promise<readonly McpSessionCapability[]> {
+  return (await loadUnstartedSessionMcpState(session)).capabilities;
+}
+
+export async function readUnstartedSessionMcpToolPredicate(session: ISessionScopeHandle): Promise<SessionMcpToolPredicate> {
+  const state = await loadUnstartedSessionMcpState(session);
+  return createSessionMcpToolPredicate(state.capabilities, state.overrides);
 }
 
 function projectSessionMcpCapability(

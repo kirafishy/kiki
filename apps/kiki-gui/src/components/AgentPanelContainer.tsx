@@ -496,18 +496,35 @@ export function AgentPanelContainer({ state, forest, agentId, visible = true, pa
     }
   }
   const usage = metrics[agentId] ?? UNKNOWN_AGENT_PANEL_METRICS;
-  const treeComplete = showsTree && !rosterIncomplete && ids.every((id) => !isUnsettledPanelMetrics(metrics[id]) && metrics[id]?.usagePartial !== true && metrics[id]?.costPartial !== true);
+  const treeTokensCovered = showsTree && !rosterIncomplete && ids.every((id) => {
+    const row = metrics[id];
+    return row !== undefined && !isUnsettledPanelMetrics(row) && row.usagePartial !== true && panelTotalTokens(row) !== null;
+  });
+  const treeComplete = treeTokensCovered && ids.every((id) => metrics[id]?.costPartial !== true);
   const treeCounting = showsTree && (rosterPending || requestIds.length > 0 && !metricsSettle.isError);
   const tree = sumAgentTreeMetrics(ids, metrics);
-  const canonical = useCanonicalSessionUsage(metricsWanted && visible && showsTree && tree.totalTokens === null, state.sessionId);
-  const canonicalTokens = canonical.usage?.accounting?.tokens;
-  const sessionTokens = canonicalTokens === undefined ? sessionState.session?.usage : undefined;
-  if (tree.totalTokens === null) {
-    if (canonicalTokens !== undefined) {
-      tree.totalTokens = canonicalTokens.input_other + canonicalTokens.input_cache_read + canonicalTokens.input_cache_creation + canonicalTokens.output;
-    } else if (sessionTokens !== undefined) {
-      tree.totalTokens = sessionTokens.input_tokens + sessionTokens.cache_read_tokens + sessionTokens.cache_creation_tokens + sessionTokens.output_tokens;
+  const canonical = useCanonicalSessionUsage(metricsWanted && visible && showsTree && !treeTokensCovered, state.sessionId);
+  const matchedSession = sessionState.session?.id === state.sessionId && sessionState.session.private !== true
+    ? sessionState.session
+    : undefined;
+  const sessionAccounting = canonical.usage?.accounting ?? matchedSession?.usage?.accounting;
+  const canonicalTotalTokens = (() => {
+    if (sessionAccounting !== undefined) {
+      const tokens = sessionAccounting.tokens;
+      const sum = tokens.input_other + tokens.input_cache_read + tokens.input_cache_creation + tokens.output;
+      if (!Number.isFinite(sum)) return null;
+      return sum > 0 || (sessionAccounting.complete && sessionAccounting.tokens_unknown !== true) ? sum : null;
     }
+    if (matchedSession?.usage_error === 'read-failed') return null;
+    const raw = matchedSession?.usage;
+    if (raw === undefined || !known(raw.input_tokens) || !known(raw.cache_read_tokens) || !known(raw.cache_creation_tokens) || !known(raw.output_tokens)) {
+      return null;
+    }
+    const sum = raw.input_tokens + raw.cache_read_tokens + raw.cache_creation_tokens + raw.output_tokens;
+    return sum > 0 ? sum : null;
+  })();
+  if (!treeTokensCovered && canonicalTotalTokens !== null) {
+    tree.totalTokens = tree.totalTokens === null ? canonicalTotalTokens : Math.max(tree.totalTokens, canonicalTotalTokens);
   }
   const { id: routeSessionId } = useParams<{ id?: string }>();
   const isMain = agentId === MAIN_AGENT_ID;

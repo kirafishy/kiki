@@ -952,6 +952,7 @@ function registerSessionExportServices(
     }),
     update: async () => undefined,
     delete: async () => {},
+    findRegisteredById: async () => undefined,
     findRegisteredByRoot: async () => undefined,
   });
   reg.define(ISessionExportService, SessionExportService);

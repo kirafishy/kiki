@@ -96,6 +96,7 @@ function stubWorkspaceService(list: IWorkspaceService['list']): IWorkspaceServic
   return {
     _serviceBrand: undefined,
     list,
+    findRegisteredById: async () => undefined,
     findRegisteredByRoot: async () => undefined,
     get: async () => undefined,
     createOrTouch: async () => {

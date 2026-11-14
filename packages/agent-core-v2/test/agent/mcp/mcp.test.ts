@@ -26,7 +26,7 @@ import { IMcpRegistryService, type McpRegistryEntry } from '#/app/mcpRegistry/mc
 import { IAtomicDocumentStore } from '#/persistence/interface/atomicDocumentStore';
 import { IOptionalCapabilityPolicy } from '#/app/optionalCapability/policy';
 import { IAgentMcpService } from '#/agent/mcp/mcp';
-import { AgentMcpService } from '#/agent/mcp/mcpService';
+import { AgentMcpService, readPersistedSessionMcpToolPredicate } from '#/agent/mcp/mcpService';
 import { ISessionMcpHandle } from '#/session/mcp/sessionMcpHandle';
 import { FilteredMcpConnectionView } from '#/session/mcp/filteredConnectionView';
 import type { McpServerConfig } from '#/mcpCore/config-schema';
@@ -379,6 +379,33 @@ describe('AgentMcpService', () => {
       'mcp-test-session',
       expect.any(Function),
     );
+  });
+
+  it('projects persisted session MCP overrides onto offline tool allowance', async () => {
+    const registry: Pick<IMcpRegistryService, 'list'> = {
+      list: async () => [
+        registryEntry('alpha'),
+        registryEntry('beta', { enabled: false }),
+        {
+          ...registryEntry('gamma'),
+          config: { transport: 'stdio', command: 'gamma', disabledTools: ['secret'] },
+        },
+      ],
+    };
+    const overrides: Record<string, unknown> = {
+      'global:alpha': 'off',
+      'global:beta': 'on',
+    };
+    const docs: Pick<IAtomicDocumentStore, 'get'> = {
+      get: async <T>() => overrides as T,
+    };
+
+    const allows = await readPersistedSessionMcpToolPredicate('session-1', '/workspace', registry, docs);
+    expect(allows('alpha', 'echo', ['echo'])).toBe(false);
+    expect(allows('beta', 'echo', ['echo'])).toBe(true);
+    expect(allows('gamma', 'echo', ['echo', 'secret'])).toBe(true);
+    expect(allows('gamma', 'secret', ['echo', 'secret'])).toBe(false);
+    expect(allows('ephemeral', 'echo', ['echo'])).toBe(true);
   });
 
   it('keeps colliding global and plugin locators isolated instead of guessing by runtime name', async () => {
