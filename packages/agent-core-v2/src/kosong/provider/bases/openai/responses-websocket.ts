@@ -1264,6 +1264,8 @@ export class ResponsesWebSocketTransport {
       (code === 'unsupported_upstream_format' ||
         code === 'unsupported_prompt_policy' ||
         code === 'origin_capability_mismatch' ||
+        code === 'origin_handshake_failed' ||
+        code === 'websocket_capacity_exceeded' ||
         (code === 'connection_retiring' && details.retirementNotExecuted));
     const suffix = details.param === undefined || details.param === null || details.param.trim().length === 0 ? '' : ` (param: ${details.param})`;
     return new ResponsesWebSocketError(`${code}: ${details.message}${suffix}`, code, {

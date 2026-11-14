@@ -31,6 +31,16 @@ import { scopeKey } from './pluginUsage';
 
 export const MAX_REQUESTS_PER_WINDOW = 150;
 const RATE_WINDOW_MS = 10_000;
+const PANEL_DOCUMENT_STALE_TIME_MS = 5 * 60_000;
+const PANEL_GRANT_SAFE_REUSE_MS = 8 * 60_000;
+
+interface PinnedPanelDocument {
+  readonly identity: string;
+  readonly html: string;
+  readonly url?: string;
+  readonly mintedAt: number;
+  readonly needsFreshGrant: boolean;
+}
 
 export function PluginPanelHost({
   pluginId,
@@ -72,6 +82,7 @@ export function PluginPanelHost({
   const { t, locale } = useI18n();
   const frameRef = useRef<HTMLIFrameElement>(null);
   const recent = useRef<number[]>([]);
+  const pinnedRef = useRef<PinnedPanelDocument | null>(null);
   const [loadSeq, setLoadSeq] = useState(0);
   const effectiveLabel = label ?? title ?? panelId;
   const effectiveTarget: PluginUsageTarget | undefined =
@@ -82,6 +93,12 @@ export function PluginPanelHost({
         ? { session_id: sessionId }
         : undefined);
   const targetKey = scopeKey(effectiveTarget);
+  const scopeId =
+    connection !== null && connection !== undefined && 'scopeId' in connection && typeof connection.scopeId === 'string'
+      ? connection.scopeId
+      : '';
+  const baseOrigin = client.baseUrl || (typeof window !== 'undefined' ? window.location.origin : '');
+  const documentIdentity = `${scopeId}\0${baseOrigin}\0${pluginId}\0${panelId}\0${targetKey}`;
   const resolvedClassName =
     className ??
     (variant === 'workspace'
@@ -90,7 +107,9 @@ export function PluginPanelHost({
   const documentQuery = useQuery({
     queryKey: ['plugin-panel-document', pluginId, panelId, targetKey],
     queryFn: () => client.getPluginPanelDocument(pluginId, panelId, effectiveTarget),
-    staleTime: 60_000,
+    staleTime: PANEL_DOCUMENT_STALE_TIME_MS,
+    gcTime: PANEL_GRANT_SAFE_REUSE_MS,
+    refetchOnWindowFocus: false,
     retry: false,
   });
 
@@ -152,30 +171,61 @@ export function PluginPanelHost({
     return () => { window.removeEventListener('message', onMessage); };
   }, [client, host, pluginId, panelId, sessionId, locale, post, t]);
 
-  if (documentQuery.isPending) {
-    return (
-      <div className={variant === 'workspace' ? 'flex min-h-0 flex-1 items-start p-4' : 'p-4'}>
-        <p className="flex items-center gap-2 text-[13px] text-ink-faint" role="status">
-          <Spinner label={t('cap.loading')} />{t('cap.panel.loading')}
-        </p>
-      </div>
-    );
-  }
-  if (documentQuery.isError) {
-    return (
-      <div className={`space-y-2 p-4 ${variant === 'workspace' ? 'min-h-0 flex-1' : ''}`} data-plugin-panel-error>
-        <InlineError error={documentQuery.error} />
-        <button type="button" className={SECONDARY_BUTTON} onClick={() => { void documentQuery.refetch(); }}>{t('common.retry')}</button>
-      </div>
-    );
-  }
   const panelDocument = documentQuery.data;
+  if (panelDocument !== undefined) {
+    const freshMintedAt = documentQuery.dataUpdatedAt || Date.now();
+    const currentPinned = pinnedRef.current;
+    if (
+      currentPinned === null ||
+      currentPinned.identity !== documentIdentity ||
+      currentPinned.html !== panelDocument.html ||
+      (currentPinned.url === undefined) !== (panelDocument.url === undefined) ||
+      (currentPinned.needsFreshGrant &&
+        panelDocument.url !== undefined &&
+        currentPinned.url !== panelDocument.url &&
+        freshMintedAt > currentPinned.mintedAt)
+    ) {
+      pinnedRef.current = {
+        identity: documentIdentity,
+        html: panelDocument.html,
+        url: panelDocument.url,
+        mintedAt: freshMintedAt,
+        needsFreshGrant:
+          panelDocument.url !== undefined && Date.now() - freshMintedAt >= PANEL_GRANT_SAFE_REUSE_MS,
+      };
+    }
+  }
+  const activeDocument =
+    pinnedRef.current !== null && pinnedRef.current.identity === documentIdentity
+      ? pinnedRef.current
+      : undefined;
+
+  if (activeDocument === undefined) {
+    if (documentQuery.isPending) {
+      return (
+        <div className={variant === 'workspace' ? 'flex min-h-0 flex-1 items-start p-4' : 'p-4'}>
+          <p className="flex items-center gap-2 text-[13px] text-ink-faint" role="status">
+            <Spinner label={t('cap.loading')} />{t('cap.panel.loading')}
+          </p>
+        </div>
+      );
+    }
+    if (documentQuery.isError) {
+      return (
+        <div className={`space-y-2 p-4 ${variant === 'workspace' ? 'min-h-0 flex-1' : ''}`} data-plugin-panel-error>
+          <InlineError error={documentQuery.error} />
+          <button type="button" className={SECONDARY_BUTTON} onClick={() => { void documentQuery.refetch(); }}>{t('common.retry')}</button>
+        </div>
+      );
+    }
+    return null;
+  }
   return (
     <iframe
       ref={frameRef}
       title={effectiveLabel}
-      src={panelDocument.url === undefined ? undefined : new URL(panelDocument.url, client.baseUrl || window.location.origin).toString()}
-      srcDoc={panelDocument.url === undefined ? panelDocument.html : undefined}
+      src={activeDocument.url === undefined ? undefined : new URL(activeDocument.url, client.baseUrl || window.location.origin).toString()}
+      srcDoc={activeDocument.url === undefined ? activeDocument.html : undefined}
       sandbox="allow-scripts"
       referrerPolicy="no-referrer"
       onLoad={() => {

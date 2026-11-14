@@ -11,7 +11,7 @@ import { LOCALE_STORAGE_KEY } from '@kiki/session-core/i18n';
 import { subscribePluginPromptInserts, type PluginPromptInsertRequest } from '@kiki/session-core';
 
 import { I18nProvider } from '../../i18n';
-import { PluginComposerSlots, buildPluginPanelHref } from './PluginComposerSlots';
+import { PluginComposerSlots, buildPluginPanelHref, fetchPluginGuiSlots } from './PluginComposerSlots';
 import { PluginStatusCapsules } from './PluginStatusCapsules';
 import { PluginMessageActions } from './PluginMessageActions';
 import { PluginSettingsSectionSlotList } from './PluginSettingsSectionCard';
@@ -264,5 +264,26 @@ describe('E12 declarative plugin GUI slot components', () => {
     expect(container.querySelector('[data-plugin-tool-summary]')?.textContent).not.toContain('Blocked');
     expect(container.querySelector('script')).toBeNull();
     expect(container.querySelector('[data-plugin-tool-details] pre')?.textContent).toContain('<script>alert(1)</script>');
+  });
+
+  it('throws on non-404 broker failures in fetchPluginGuiSlots instead of silently returning an empty slot array', async () => {
+    const fakeConnection = {
+      config: { url: 'http://127.0.0.1:49732', token: 'tok' },
+    } as unknown as Parameters<typeof fetchPluginGuiSlots>[0];
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    fetchSpy.mockResolvedValueOnce(new Response('not found', { status: 404 }));
+    await expect(fetchPluginGuiSlots(fakeConnection, { sessionId: 'sess-1' })).resolves.toEqual([]);
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ code: 50001, msg: 'server busy', data: null }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    await expect(fetchPluginGuiSlots(fakeConnection, { sessionId: 'sess-1' })).rejects.toThrow('server busy');
+
+    fetchSpy.mockResolvedValueOnce(new Response('bad gateway', { status: 502 }));
+    await expect(fetchPluginGuiSlots(fakeConnection, { sessionId: 'sess-1' })).rejects.toThrow(/HTTP 502/);
   });
 });
