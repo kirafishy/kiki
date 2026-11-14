@@ -158,6 +158,7 @@ import {
   type ToolCallIdResponseNormalizer,
 } from './toolCallIdNormalizer';
 import { projectDynamicToolSchemas } from './dynamicToolProjection';
+import { PromptCacheWindow } from './promptCacheWindow';
 import {
   LlmRequest,
   llmRequestTraceKey,
@@ -221,6 +222,7 @@ interface ResolvedLLMRequest {
   readonly systemPrompt: string;
   readonly tools: readonly Tool[];
   readonly messages: Message[];
+  readonly contextMessages: readonly Message[];
   readonly source: AgentLLMRequestSource | undefined;
   readonly logFields: AgentLLMRequestLogFields;
 }
@@ -282,7 +284,7 @@ export class AgentLLMRequesterService extends Disposable implements IAgentLLMReq
 
   private retryAttribution: { key: string; value: import('#/kosong/model/requestAdmission').RequestAttribution } | undefined;
   private readonly toolCallIdNormalizer = new ToolCallIdNormalizer();
-  private readonly frozenTurnTools = new Map<number, readonly Tool[]>();
+  private promptCacheWindow: PromptCacheWindow | undefined;
   private previousToolset: { hash: string; tools: readonly LlmRequestToolSchema[] } | undefined;
   private readonly toolsetDigests = new WeakMap<readonly Tool[], ToolsetDigest>();
   private systemPromptDigest: { readonly prompt: string; readonly hash: string } | undefined;
@@ -365,7 +367,10 @@ export class AgentLLMRequesterService extends Disposable implements IAgentLLMReq
     this.states.contributeState(llmRequesterMediaStrippedTurnsKey);
     this.states.contributeState(llmRequesterEmittedThinkingEffortWarningsKey);
     this._register(this.eventBus.subscribe(ContextSpliced, (event) => {
-      if (event.deleteCount > 0) this.closeResponsesTransport();
+      if (event.deleteCount > 0) {
+        this.closeResponsesTransport();
+        this.promptCacheWindow = undefined;
+      }
     }));
     const onDidSectionChange = this.config.onDidSectionChange;
     if (onDidSectionChange !== undefined) {
@@ -825,7 +830,7 @@ export class AgentLLMRequesterService extends Disposable implements IAgentLLMReq
         usageKnown: usage !== undefined,
       });
       if (usage !== undefined) {
-        this.tokenCounting.measured(request.messages, [message], usage);
+        this.tokenCounting.measured(request.contextMessages, [message], usage);
       }
       this.logResponse(request.logFields, usage ?? emptyUsage(), timing);
       if (extensions?.hasSettledResponseObservers === true) {
@@ -1290,6 +1295,15 @@ export class AgentLLMRequesterService extends Disposable implements IAgentLLMReq
       sessionId: this.sessionContext.sessionId, agentId: this.agentContext.agentId,
       profileName: this.profile.data().profileName, modelAlias: resolved.modelAlias, workspaceRoot: this.sessionContext.cwd,
     });
+    const windowKey = JSON.stringify([
+      this.states.get(contextWindowEpochKey),
+      this.profile.data().renderGeneration,
+      this.profile.data().boundProfile?.promptBase?.promptDiagnostics?.binding_revision ?? this.profile.getCognitionSnapshot()?.bindingRevision ?? cognition.bindingRevision,
+    ]);
+    if (this.promptCacheWindow?.key !== windowKey) this.promptCacheWindow = new PromptCacheWindow(windowKey);
+    const extensionProjection = overrides.source?.type === 'turn' && overrides.systemPrompt === undefined
+      ? this.promptCacheWindow.projectExtensions(sections?.text ?? '', messages)
+      : { text: sections?.text ?? '', messages: [...messages] };
     const systemPrompt = anchoredPrompt ?? (overrides.systemPrompt !== undefined
       ? appendSharedPromptField(
           injectDelegationContext(resolvedSystemPrompt, this.profile.data().boundProfile?.promptBase?.delegationSnippet),
@@ -1303,9 +1317,10 @@ export class AgentLLMRequesterService extends Disposable implements IAgentLLMReq
       identity,
       modelAlias: resolved.modelAlias,
       thinkingEffort: resolved.thinkingLevel,
-      systemPrompt: sections?.text ? `${systemPrompt}\n\n${sections.text}` : systemPrompt,
-      tools: this.toolsForRequest(overrides, promptFields, promptVariables),
-      messages: [...messages],
+      systemPrompt: extensionProjection.text ? `${systemPrompt}\n\n${extensionProjection.text}` : systemPrompt,
+      tools: this.toolsForRequest(overrides, promptFields, promptVariables, this.promptCacheWindow),
+      messages: extensionProjection.messages,
+      contextMessages: [...messages],
       source: overrides.source,
       logFields: {
         ...logFieldsForSource(overrides.source),
@@ -1329,22 +1344,14 @@ export class AgentLLMRequesterService extends Disposable implements IAgentLLMReq
     overrides: AgentLLMRequestOverrides,
     promptFields: ResolvedPromptFieldOverrides,
     promptVariables: ReturnType<typeof customPromptVariables>,
+    window: PromptCacheWindow,
   ): readonly Tool[] {
-    const turnId = overrides.source?.type === 'turn' && overrides.tools === undefined
-      ? overrides.source.turnId : undefined;
-    if (turnId !== undefined) {
-      const frozen = this.frozenTurnTools.get(turnId);
-      if (frozen !== undefined) return frozen;
-      for (const id of this.frozenTurnTools.keys()) {
-        if (id < turnId) this.frozenTurnTools.delete(id);
-      }
-    }
     const tools = (overrides.tools ?? this.defaultTools()).map((tool) => ({
       ...tool,
       description: applyToolPromptFields(tool.name, tool.description, promptFields, promptVariables),
     }));
-    if (turnId !== undefined) this.frozenTurnTools.set(turnId, tools);
-    return tools;
+    if (overrides.source?.type !== 'turn' || overrides.tools !== undefined) return tools;
+    return window.toolsForTurn(overrides.source.turnId, tools, JSON.stringify([promptFields.values, promptVariables]));
   }
 
   private resolveTurnConfig(source: AgentLLMRequestSource | undefined): TurnRequestConfig | undefined {

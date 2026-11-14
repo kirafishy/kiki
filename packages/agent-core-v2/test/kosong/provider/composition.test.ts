@@ -16,6 +16,7 @@ import { generate, readGenerateFailureFacts } from '#/kosong/contract/generate';
 import { fromErrorPayload, toErrorPayload } from '#/_base/errors/serialize';
 import { safeProviderFailureDetails } from '#/kosong/contract/streamDiagnostics';
 import { IAgentProfileService } from '#/agent/profile/profile';
+import { projectDynamicToolSchemas } from '#/agent/llmRequester/dynamicToolProjection';
 import { IAgentTaskService } from '#/agent/task/task';
 import { ITaskService } from '#/app/task/task';
 import { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
@@ -2681,6 +2682,37 @@ describe('Anthropic request tail structure', () => {
   const prefill: Message = { role: 'assistant', content: [{ type: 'text', text: 'partial answer' }], toolCalls: [] };
   const toolCall: Message = { role: 'assistant', content: [], toolCalls: [{ type: 'function', id: 'call-fixture', name: 'Read', arguments: '{}' }] };
   const toolResult: Message = { role: 'tool', content: [{ type: 'text', text: 'result' }], toolCallId: 'call-fixture', toolCalls: [] };
+
+  it.each(['claude-sonnet-4-5', 'gemini-4-carbon'])('keeps selected schemas and extension updates after tool results without changing system blocks: %s', async (model) => {
+    type Body = { system: unknown; messages: Array<{ role: string; content: Array<{ type: string; text?: string; tool_use_id?: string }> }> };
+    const sent: Body[] = [];
+    const provider = new AnthropicChatProvider({
+      model, apiKey: 'YOUR_API_KEY', stream: false, defaultMaxTokens: 1024,
+      clientFactory: () => new Anthropic({ apiKey: 'YOUR_API_KEY', maxRetries: 0,
+        fetch: async (input, init) => {
+          sent.push(JSON.parse(await new Request(input, init).text()));
+          return new Response(JSON.stringify(anthropicMessageResponse()), { headers: { 'content-type': 'application/json' } });
+        },
+      }),
+    });
+    const before = [user, prefill, user];
+    await drain(await provider.generate('stable system', [], before));
+    const schemas: Message = { role: 'system', content: [], toolCalls: [], tools: [
+      { name: 'plugin__records__read', description: 'Read a record', parameters: { type: 'object' } },
+    ] };
+    const after = [...before, { ...toolCall, toolCalls: [{ ...toolCall.toolCalls[0]!, name: 'SelectTools' }] }, toolResult, schemas,
+      { role: 'user' as const, content: [{ type: 'text' as const, text: '<system-reminder>Updated extension state</system-reminder>' }], toolCalls: [] }];
+    await drain(await provider.generate('stable system', [], [...projectDynamicToolSchemas(after, 'anthropic', false)]));
+    expect(JSON.stringify(sent[1]?.system)).toBe(JSON.stringify(sent[0]?.system));
+    expect(JSON.stringify(sent[1]?.system)).not.toContain('dynamic_tool_schemas');
+    expect(JSON.stringify(sent[1]?.messages.slice(0, 2))).toBe(JSON.stringify(sent[0]?.messages.slice(0, 2)));
+    expect(sent[1]?.messages.map((message) => message.role)).toEqual(['user', 'assistant', 'user', 'assistant', 'user']);
+    expect(sent[1]?.messages.at(-1)?.content.map((part) => part.type)).toEqual(['tool_result', 'text', 'text']);
+    expect(sent[1]?.messages.at(-1)?.content[0]?.tool_use_id).toBe('call-fixture');
+    expect(sent[1]?.messages.at(-1)?.content[1]?.text).toBe(`<dynamic_tool_schemas>${JSON.stringify(schemas.tools)}</dynamic_tool_schemas>`);
+    expect(sent[1]?.messages.at(-1)?.content[2]?.text).toBe('<system-reminder>Updated extension state</system-reminder>');
+    expect(schemas.content).toEqual([]);
+  });
 
   it.each(['claude-sonnet-4-5', 'gemini-4-carbon', 'gemini/gemini-4-argon', 'GeMiNi-4-hydrogen', 'opaque-gemini'])('merges tool results and following steering into one user turn: %s', async (model) => {
     let sent: { messages: Array<{ role: string; content: Array<{ type: string; text?: string }> }> } | undefined;
