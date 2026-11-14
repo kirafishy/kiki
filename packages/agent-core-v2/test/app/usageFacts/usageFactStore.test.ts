@@ -111,6 +111,25 @@ describe('UsageFactStore', () => {
     } finally { release(); await first; }
   });
 
+  it.each([false, true])('accepts usage for a recreated public session after an intervening private read: %s', async (readPrivate) => {
+    const documents = ix.get(IAtomicDocumentStore);
+    const sessionScope = 'sessions/example/session';
+    await documents.set(sessionScope, 'state.json', { ...session, private: false, agents: {} });
+    await facts.setSessionPrivacy({ ...session, private: true });
+    await facts.commit(SCOPE, 0, checkpoint(1), [normalizeUsageFact(fact(), 'main')!]);
+    expect(await storage.size(DIRECTORY, 'facts.jsonl')).toBeUndefined();
+    await documents.set(sessionScope, 'state.json', { ...session, private: true, agents: {} });
+    if (readPrivate) await expect(facts.summary(SCOPE)).resolves.toEqual({});
+    await storage.delete(sessionScope, 'state.json');
+    const replacement = { ...session, createdAt: 2, private: false };
+    await documents.set(sessionScope, 'state.json', { ...replacement, agents: {} });
+    await model.catalog([{ ...replacement, deleted: false }], [{ source: SCOPE, workspaceId: session.workspaceId, sessionId: session.id }]);
+    await facts.commit(SCOPE, 0, checkpoint(1), [normalizeUsageFact(fact(), 'main')!]);
+    expect(await facts.journalSize(SCOPE)).toBeGreaterThan(0);
+    expect((await facts.read(SCOPE)).records).toHaveLength(1);
+    expect((await model.query(query)).total).toMatchObject({ usage: fact().usage, knownRecords: 1 });
+  });
+
   it('hides SQL totals through privacy cataloging and restores them when privacy is cleared', async () => {
     logs.append(SCOPE, KEY, fact());
     await logs.flush();
