@@ -361,4 +361,24 @@ describe('UsageFactStore', () => {
     await entered; controller.abort(); await expect(reading).rejects.toMatchObject({ name: 'AbortError' }); release();
     expect((await facts.read(SCOPE)).records).toHaveLength(1);
   });
+
+  it('caches session privacy across agent scopes until state.json changes on disk', async () => {
+    const documents = ix.get(IAtomicDocumentStore);
+    await documents.set('sessions/example/session', 'state.json', { id: 'session', private: false, agents: {} });
+    const getSpy = vi.spyOn(documents, 'get');
+    const agentScopes = Array.from({ length: 48 }, (_, index) => `sessions/example/session/agents/agent-${index}`);
+    for (const agentScope of agentScopes.slice(0, 4)) {
+      logs.append(agentScope, KEY, fact(1));
+    }
+    await logs.flush();
+
+    await Promise.all(agentScopes.map((agentScope) => facts.journalSize(agentScope)));
+    await Promise.all(agentScopes.slice(0, 8).map((agentScope) => facts.summary(agentScope)));
+    expect(getSpy).toHaveBeenCalledTimes(1);
+
+    await documents.set('sessions/example/session', 'state.json', { id: 'session', private: true, agents: {} });
+    const summaries = await Promise.all(agentScopes.slice(0, 8).map((agentScope) => facts.summary(agentScope)));
+    expect(summaries.every((entry) => entry.totals === undefined)).toBe(true);
+    expect(getSpy).toHaveBeenCalledTimes(2);
+  });
 });

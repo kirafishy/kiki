@@ -160,3 +160,49 @@ it('halts on a blocked WAL checkpoint and automatically resumes after the reader
       recoveryMs: performance.now() - releasedAt, documents: count() }));
   } finally { if (reader.isTransaction) reader.exec('ROLLBACK'); reader.close(); }
 });
+
+it('skips non-branch subagent directories without inserting skip rows when indexSubagents is false while indexing side branches', async () => {
+  await wire('s1', 'main needle');
+  await mkdir(join(home, 's1', 'agents', 'sub-1'), { recursive: true });
+  await writeFile(join(home, 's1', 'agents', 'sub-1', 'wire.jsonl'), line('subagent hidden one'));
+  await mkdir(join(home, 's1', 'agents', 'sub-2'), { recursive: true });
+  await writeFile(join(home, 's1', 'agents', 'sub-2', 'wire.jsonl'), line('subagent hidden two'));
+  await mkdir(join(home, 's1', 'agents', 'branch-1'), { recursive: true });
+  await writeFile(join(home, 's1', 'agents', 'branch-1', 'wire.jsonl'), line('branch visible needle'));
+  await writeFile(
+    join(home, 's1', 'state.json'),
+    JSON.stringify({
+      title: 'branch session',
+      agents: {
+        'sub-1': { labels: {} },
+        'branch-1': { labels: { branch: 'true' } },
+      },
+    }),
+  );
+  index.resetReadCounters();
+  await index.syncSession(session('s1'));
+  expect(index.syncStatus.wireFilesRead).toBe(2);
+  const rows = index.db
+    .prepare('SELECT agent_id, policy FROM files WHERE session_id=? ORDER BY agent_id')
+    .all('s1') as { agent_id: string; policy: string }[];
+  expect(rows).toEqual([
+    { agent_id: 'branch-1', policy: 'full' },
+    { agent_id: 'main', policy: 'full' },
+  ]);
+  expect((await index.search({
+    query: 'branch visible',
+    literalQuery: normalizeLiteral('branch visible'),
+    mode: 'literal',
+    sort: 'time_desc',
+    op: 'AND',
+    pageSize: 10,
+  })).rows).toHaveLength(1);
+  expect((await index.search({
+    query: 'subagent hidden',
+    literalQuery: normalizeLiteral('subagent hidden'),
+    mode: 'literal',
+    sort: 'time_desc',
+    op: 'AND',
+    pageSize: 10,
+  })).rows).toHaveLength(0);
+});

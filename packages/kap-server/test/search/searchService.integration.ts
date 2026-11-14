@@ -1270,5 +1270,39 @@ describe('GlobalSearchService', () => {
         }));
       expect(project(live)).toEqual(project(index));
     });
+
+    it('uses targeted syncSession on incremental main updates and ignores subagent or checkpoint watch noise', { timeout: 30_000 }, async () => {
+      const s1 = summary('s1', 'first', T1);
+      const s2 = summary('s2', 'second', T1);
+      await writeTitle(home!, 's1', 'first');
+      await writeTitle(home!, 's2', 'second');
+      const main1 = await writeWire(home!, 's1', 'main', [userLine('initial one', T1)]);
+      await writeWire(home!, 's2', 'main', [userLine('initial two', T1)]);
+      const service = track(makeService(home!, gettableIndex([s1, s2])));
+      await service.reindex();
+      await expect.poll(async () => (await service.status()).indexer?.pendingSessions, { timeout: 10_000 }).toBe(0);
+
+      const host = service['sqliteHost'];
+      let fullSyncCalls = 0;
+      const targetedIds: string[] = [];
+      const origSync = host.sync.bind(host);
+      const origSyncSession = host.syncSession.bind(host);
+      host.sync = (sessions) => { fullSyncCalls += 1; origSync(sessions); };
+      host.syncSession = (input) => { targetedIds.push(input.id); origSyncSession(input); };
+
+      await writeWire(home!, 's1', 'sub-noise', [userLine('subagent ignored', T2)]);
+      const cpDir = join(home!, 'sessions', WS, 's1', 'replay-checkpoints');
+      await mkdir(cpDir, { recursive: true });
+      await writeFile(join(cpDir, 'engine-v1'), '{"seq":1}', 'utf8');
+      await writeFile(join(home!, 'sessions', WS, 's1', 'state.json.tmp.99'), '{}', 'utf8');
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect(fullSyncCalls).toBe(0);
+      expect(targetedIds).toEqual([]);
+
+      await appendFile(main1, `${userLine('targeted incremental hit', T3)}\n`, 'utf8');
+      await expect.poll(async () => (await service.search({ query: 'targeted incremental hit', mode: 'literal', indexOnly: true })).items.length, { timeout: 10_000 }).toBe(1);
+      expect(fullSyncCalls).toBe(0);
+      expect(targetedIds).toEqual(['s1']);
+    });
   });
 });

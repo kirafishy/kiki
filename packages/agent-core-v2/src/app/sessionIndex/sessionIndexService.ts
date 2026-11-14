@@ -278,6 +278,9 @@ export class FileSessionIndex extends Disposable implements ISessionIndex {
       const entries = [...this.watchedSessions.entries()].slice(0, WATCH_BATCH_SIZE);
       for (const [key] of entries) this.watchedSessions.delete(key);
       const changedIds = new Set(entries.map(([, value]) => value.id));
+      if (!this.recoveryRequired && this.mirror.dirtyEpoch() === undefined) {
+        await this.mirror.drain();
+      }
       let conflicted = false;
       const subscription = this.mirror.onDidChange(({ id }) => {
         if (changedIds.has(id)) conflicted = true;

@@ -267,12 +267,19 @@ export class UsageAggregationService {
         this.inventoryRevision++;
         this.agentInventories.clear();
         this.sourceMetadata.clear();
+        this.progressFullRequired = true;
+        this.progressDirtySessions.clear();
       } else if (typeof key === 'string') {
         this.dirtySessions.set(key, this.replayEpoch);
         this.sessionVersions.set(key, (this.sessionVersions.get(key) ?? 0) + 1);
         this.agentInventories.delete(key);
-        const prefix = `sessions/${key.replace('\0', '/')}/agents/`;
-        for (const source of this.sourceMetadata.keys()) if (source.startsWith(prefix)) this.sourceMetadata.delete(source);
+        if (typeof change === 'object' && change.kind === 'agent') {
+          this.sourceMetadata.delete(`sessions/${key.replace('\0', '/')}/agents/${change.agentId}`);
+        } else {
+          const prefix = `sessions/${key.replace('\0', '/')}/agents/`;
+          for (const source of this.sourceMetadata.keys()) if (source.startsWith(prefix)) this.sourceMetadata.delete(source);
+        }
+        this.progressDirtySessions.add(key);
       }
       this.progressInventoryReady = false;
       this.modelReady = false;
@@ -790,6 +797,9 @@ export class UsageAggregationService {
   private readonly canonicalProgress = new Map<string, { identity: string; startOffset: number; readBytes: number; totalBytes: number }>();
   private progressInventory?: Promise<void>;
   private progressInventoryReady = false;
+  private progressFullRequired = true;
+  private readonly progressDirtySessions = new Set<string>();
+  private progressRowsBySession = new Map<string, readonly { summary: SessionSummary; metadata: UsageSourceMetadata; journalSize: number }[]>();
   private progressRows: readonly { summary: SessionSummary; metadata: UsageSourceMetadata; journalSize: number }[] = [];
   private retainedProgress: readonly { source: string; size: number; readBytes: number; complete: boolean }[] = [];
 
@@ -820,35 +830,86 @@ export class UsageAggregationService {
     if (this.progressInventoryReady || this.progressInventory !== undefined) return;
     const epoch = this.replayEpoch;
     const signal = this.modelController.signal;
+    const fullScan = this.progressFullRequired || this.progressRowsBySession.size === 0 || !this.sourceChanges?.ready;
+    const dirtySnapshot = fullScan ? [] : [...this.progressDirtySessions];
     const work = (async () => {
       const index = this.core.accessor.get(ISessionIndex), model = this.core.accessor.get(IUsageReadModel), facts = this.core.accessor.get(IUsageFactStore);
-      const rows: { summary: SessionSummary; metadata: UsageSourceMetadata; journalSize: number }[] = [];
-      let before: string | undefined;
-      do {
-        const page = await waitForSource(index.listRecent({ includeArchived: true, limit: INDEX_PAGE_SIZE, before }), signal);
-        for (const summary of page.items) {
-          if (summary.private === true) continue;
-          const session = sessionScopeOf(workspacePersistenceScope('sessions', summary.workspaceId), summary.id);
-          const agents = await waitForSource(this.agentsOf(summary), signal);
-          for (let offset = 0; offset < agents.length; offset += 32) {
-            rows.push(...await Promise.all(agents.slice(offset, offset + 32).map(async (agentId) => {
-              const source = agentScopeOf(session, agentId);
-              const [metadata, journalSize] = await Promise.all([this.metadataOf(source, agentId), facts.journalSize(source, signal)]);
-              return { summary, metadata, journalSize };
-            })));
-            await yieldToEventLoop(undefined, { signal });
+      const collectSessionRows = async (summary: SessionSummary): Promise<{ summary: SessionSummary; metadata: UsageSourceMetadata; journalSize: number }[]> => {
+        if (summary.private === true) return [];
+        const session = sessionScopeOf(workspacePersistenceScope('sessions', summary.workspaceId), summary.id);
+        const agents = await waitForSource(this.agentsOf(summary), signal);
+        const sessionRows: { summary: SessionSummary; metadata: UsageSourceMetadata; journalSize: number }[] = [];
+        for (let offset = 0; offset < agents.length; offset += 32) {
+          sessionRows.push(...await Promise.all(agents.slice(offset, offset + 32).map(async (agentId) => {
+            const source = agentScopeOf(session, agentId);
+            const [metadata, journalSize] = await Promise.all([this.metadataOf(source, agentId), facts.journalSize(source, signal)]);
+            return { summary, metadata, journalSize };
+          })));
+          await yieldToEventLoop(undefined, { signal });
+        }
+        return sessionRows;
+      };
+      if (fullScan) {
+        const bySession = new Map<string, readonly { summary: SessionSummary; metadata: UsageSourceMetadata; journalSize: number }[]>();
+        const rows: { summary: SessionSummary; metadata: UsageSourceMetadata; journalSize: number }[] = [];
+        let before: string | undefined;
+        do {
+          const page = await waitForSource(index.listRecent({ includeArchived: true, limit: INDEX_PAGE_SIZE, before }), signal);
+          for (const summary of page.items) {
+            const sessionRows = await collectSessionRows(summary);
+            bySession.set(sessionKey(summary), sessionRows);
+            rows.push(...sessionRows);
+          }
+          before = page.nextCursor;
+        } while (before !== undefined);
+        this.retainedProgress = await this.core.accessor.get(IRetainedUsageService).readModelImportProgress?.(signal) ?? [];
+        const heads = await model.sources(signal);
+        for (const { source, head } of heads) {
+          const metadata = await this.sourceMetadata.get(source);
+          const checkpoint = head.checkpoint;
+          if (metadata !== undefined && checkpoint?.valid && head.pendingCheckpoint === undefined && checkpoint.generation === metadata.generation && checkpoint.offset === metadata.size && checkpoint.size === metadata.size && checkpoint.mtimeMs === metadata.mtimeMs) this.verifiedSources.set(source, sourceIdentity(metadata));
+        }
+        if (epoch === this.replayEpoch) {
+          this.progressRowsBySession = bySession;
+          this.progressDirtySessions.clear();
+          this.progressFullRequired = false;
+          this.progressRows = rows;
+          this.progressInventoryReady = true;
+        }
+        return;
+      }
+      const nextBySession = new Map(this.progressRowsBySession);
+      const refreshedSources: UsageSourceMetadata[] = [];
+      for (const key of dirtySnapshot) {
+        const sep = key.indexOf('\0');
+        const workspaceId = sep >= 0 ? key.slice(0, sep) : undefined;
+        const sessionId = sep >= 0 ? key.slice(sep + 1) : key;
+        const summary = await waitForSource(index.get(sessionId, workspaceId), signal);
+        if (summary === undefined || summary.private === true) {
+          nextBySession.delete(key);
+          continue;
+        }
+        const sessionRows = await collectSessionRows(summary);
+        nextBySession.set(sessionKey(summary), sessionRows);
+        for (const row of sessionRows) refreshedSources.push(row.metadata);
+      }
+      this.retainedProgress = await this.core.accessor.get(IRetainedUsageService).readModelImportProgress?.(signal) ?? [];
+      if (refreshedSources.length > 0) {
+        const snapshots = await model.summaries(refreshedSources.map((item) => item.source), signal);
+        for (const metadata of refreshedSources) {
+          const head = snapshots[metadata.source]?.head;
+          const checkpoint = head?.checkpoint;
+          if (checkpoint?.valid && head?.pendingCheckpoint === undefined && checkpoint.generation === metadata.generation && checkpoint.offset === metadata.size && checkpoint.size === metadata.size && checkpoint.mtimeMs === metadata.mtimeMs) {
+            this.verifiedSources.set(metadata.source, sourceIdentity(metadata));
           }
         }
-        before = page.nextCursor;
-      } while (before !== undefined);
-      this.retainedProgress = await this.core.accessor.get(IRetainedUsageService).readModelImportProgress?.(signal) ?? [];
-      const heads = await model.sources(signal);
-      for (const { source, head } of heads) {
-        const metadata = await this.sourceMetadata.get(source);
-        const checkpoint = head.checkpoint;
-        if (metadata !== undefined && checkpoint?.valid && head.pendingCheckpoint === undefined && checkpoint.generation === metadata.generation && checkpoint.offset === metadata.size && checkpoint.size === metadata.size && checkpoint.mtimeMs === metadata.mtimeMs) this.verifiedSources.set(source, sourceIdentity(metadata));
       }
-      if (epoch === this.replayEpoch) { this.progressRows = rows; this.progressInventoryReady = true; }
+      if (epoch === this.replayEpoch) {
+        this.progressRowsBySession = nextBySession;
+        for (const key of dirtySnapshot) this.progressDirtySessions.delete(key);
+        this.progressRows = [...nextBySession.values()].flat();
+        this.progressInventoryReady = this.progressDirtySessions.size === 0 && !this.progressFullRequired;
+      }
     })();
     this.progressInventory = work;
     void work.catch((error: unknown) => { if (!signal.aborted) this.core.accessor.get(ILogService).warn('Usage import progress inventory pending', error); }).finally(() => { if (this.progressInventory === work) this.progressInventory = undefined; });
@@ -892,7 +953,7 @@ export class UsageAggregationService {
         const verifyAll = full || this.verifiedInventoryRevision !== this.inventoryRevision || !this.sourceChanges?.ready || this.now() - this.modelVerifiedAt >= SOURCE_RECHECK_MS || rangeStart < this.modelRangeStart;
         const heads = new Map(verifyAll ? (await waitForSource(model.sources(signal), signal)).map((row) => [row.source, row.head]) : []);
         if (verifyAll) {
-          if (full || this.verifiedInventoryRevision >= 0 && (!this.sourceChanges?.ready || this.now() - this.modelVerifiedAt >= SOURCE_RECHECK_MS)) { this.agentInventories.clear(); this.sourceMetadata.clear(); this.progressInventoryReady = false; }
+          if (full || this.verifiedInventoryRevision >= 0 && (!this.sourceChanges?.ready || this.now() - this.modelVerifiedAt >= SOURCE_RECHECK_MS)) { this.agentInventories.clear(); this.sourceMetadata.clear(); this.progressFullRequired = true; this.progressDirtySessions.clear(); this.progressInventoryReady = false; }
           this.modelExcludedSources.clear();
           this.modelRangeStart = rangeStart;
         }

@@ -142,7 +142,7 @@ export function buildSessionSummary(fields: {
     executionPhase: fields.executionPhase,
     custom: fields.custom,
     lastTurnReason: fields.lastTurnReason,
-    usage: fields.private === true ? undefined : fields.usage,
+    usage: fields.private === true ? undefined : parseSessionUsageSummary(fields.usage),
     executorId: fields.agents?.['main']?.executor,
     negotiated: fields.agents?.['main']?.negotiated,
     allowKikiSubagents: fields.agents?.['main']?.allowKikiSubagents,
@@ -167,6 +167,7 @@ export function summaryMatchesChildOf(
 export function summaryEquals(a: SessionSummary, b: SessionSummary): boolean {
   return (
     a.id === b.id &&
+    a.personaId === b.personaId &&
     a.workspaceId === b.workspaceId &&
     (a.cwd === undefined || b.cwd === undefined
       ? a.cwd === b.cwd

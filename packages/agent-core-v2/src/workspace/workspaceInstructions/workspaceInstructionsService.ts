@@ -133,6 +133,7 @@ export class WorkspaceInstructionsService
             (path: string) => ignored(path.toLowerCase()),
             { subtree: (path: string) => ignored.subtree(path.toLowerCase()) },
           ),
+          signal: true,
         });
         this._register(handle);
         this._register(

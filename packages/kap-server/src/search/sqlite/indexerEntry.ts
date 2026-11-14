@@ -124,8 +124,8 @@ export async function runSqliteIndexerCommand(path: string): Promise<void> {
           } else await index.syncSession(work.session);
           if (targeted.get(id) === work) targeted.delete(id);
           const missing = !index.db.prepare('SELECT 1 FROM sessions WHERE id=?').get(id);
-          report({ type: 'session_synced', sessionId: id, revision: work.revision, missing });
           status();
+          report({ type: 'session_synced', sessionId: id, revision: work.revision, missing });
           continue;
         }
         if (inventory) {

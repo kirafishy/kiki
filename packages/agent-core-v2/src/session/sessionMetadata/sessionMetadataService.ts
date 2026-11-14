@@ -5,8 +5,8 @@ import { Emitter, type Event } from '#/_base/event';
 import { ILogService } from '#/_base/log/log';
 import { BugIndicatingError } from '#/_base/errors/errors';
 import { defineState } from '#/state/state';
-import { ISessionIndexMirror } from '#/app/sessionIndex/sessionIndex';
-import { buildSessionSummary } from '#/app/sessionIndex/sessionIndexSource';
+import { ISessionIndexMirror, type SessionSummary } from '#/app/sessionIndex/sessionIndex';
+import { buildSessionSummary, summaryEquals } from '#/app/sessionIndex/sessionIndexSource';
 import { IUsageFactStore } from '#/app/usageFacts/usageFactStore';
 import { addSessionUsage } from '#/app/sessionIndex/sessionUsageSummary';
 import type { TokenUsage } from '#/kosong/contract/usage';
@@ -117,6 +117,7 @@ export class SessionMetadata extends Service implements ISessionMetadata {
 
   private readonly deferredChanges = new Set<keyof SessionMeta>();
   private detached: { readonly source: SessionMeta; readonly value: SessionMeta } | undefined;
+  private lastMirroredSummary: SessionSummary | undefined;
   private readonly outcomes: AgentOutcomeDocuments;
 
   private async persist(): Promise<PersistedSessionMeta> {
@@ -471,28 +472,29 @@ export class SessionMetadata extends Service implements ISessionMetadata {
   private mirrorToReadModel(source: SessionMeta = this.data): void {
     if (this.ctx.ephemeral === true) return;
     try {
-      this.mirror.record(
-        buildSessionSummary({
-          id: source.id,
-          workspaceId: this.ctx.workspaceId,
-          cwd: this.ctx.cwd,
-          worktree: source.worktree,
-          title: source.title,
-          lastPrompt: source.lastPrompt,
-          delivery: source.delivery,
-          createdAt: source.createdAt,
-          updatedAt: source.updatedAt,
-          activityUpdatedAt: source.activityUpdatedAt,
-          archived: source.archived === true,
-          private: source.private,
-          archivedAt: source.archivedAt,
-          executionPhase: source.executionPhase,
-          custom: source.custom,
-          lastTurnReason: source.lastTurnReason,
-          usage: source.usage,
-          agents: source.agents,
-        }),
-      );
+      const summary = buildSessionSummary({
+        id: source.id,
+        workspaceId: this.ctx.workspaceId,
+        cwd: this.ctx.cwd,
+        worktree: source.worktree,
+        title: source.title,
+        lastPrompt: source.lastPrompt,
+        delivery: source.delivery,
+        createdAt: source.createdAt,
+        updatedAt: source.updatedAt,
+        activityUpdatedAt: source.activityUpdatedAt,
+        archived: source.archived === true,
+        private: source.private,
+        archivedAt: source.archivedAt,
+        executionPhase: source.executionPhase,
+        custom: source.custom,
+        lastTurnReason: source.lastTurnReason,
+        usage: source.usage,
+        agents: source.agents,
+      });
+      if (this.lastMirroredSummary !== undefined && summaryEquals(this.lastMirroredSummary, summary)) return;
+      this.mirror.record(summary);
+      this.lastMirroredSummary = summary;
     } catch (error) {
       this.log.warn('session index mirror record failed; the read model heals by reconciliation', {
         sessionId: this.ctx.sessionId,

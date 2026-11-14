@@ -86,7 +86,17 @@ export class WorkspaceFsWatchService extends Disposable implements IWorkspaceFsW
   private ensureHandle(): void {
     if (this.handle !== undefined) return;
     this.loadGitignore();
-    const handle = this.hostFsWatch.watch(this.workDir, { recursive: true });
+    const handle = this.hostFsWatch.watch(this.workDir, {
+      recursive: true,
+      ignored: (candidate) => {
+        const rel = this.toRel(candidate);
+        return (
+          rel !== '.' &&
+          !rel.startsWith('..') &&
+          (rel === '.git' || rel.startsWith('.git/') || this.matcher.ignores(rel))
+        );
+      },
+    });
     this.handle = handle;
     this.handleSub = handle.onDidChange((e) => this.onRaw(e));
   }

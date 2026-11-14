@@ -53,6 +53,8 @@ export class UsageFactStore extends Disposable implements IUsageFactStore {
   declare readonly _serviceBrand: undefined;
   private readonly operations = new Map<string, Promise<unknown>>();
   private readonly damaged = new Set<string>();
+  private readonly privacyCache = new Map<string, { fingerprint: string; value: boolean }>();
+  private readonly privacyFlights = new Map<string, Promise<boolean>>();
   constructor(
     @IAppendLogStore private readonly logs: IAppendLogStore,
     @IFileSystemStorageService private readonly storage: IFileSystemStorageService,
@@ -88,13 +90,51 @@ export class UsageFactStore extends Disposable implements IUsageFactStore {
   override async dispose(): Promise<void> {
     await super.dispose();
     while (this.operations.size > 0) await Promise.allSettled(this.operations.values());
+    this.privacyCache.clear();
+    this.privacyFlights.clear();
   }
   async setSessionPrivacy(summary: SessionSummary): Promise<void> {
+    const suffix = `/${summary.workspaceId}/${summary.id}`;
+    for (const key of this.privacyCache.keys()) {
+      if (key.endsWith(suffix)) this.privacyCache.delete(key);
+    }
     await this.model.setSessionPrivacy(summary.workspaceId, summary.id, summary.private === true);
   }
+  private async stateFingerprint(session: string): Promise<string | undefined> {
+    if (this.storage.stat !== undefined) {
+      const info = await this.storage.stat(session, 'state.json');
+      return info === undefined ? undefined : `${info.size}:${info.revision}:${info.identity ?? ''}`;
+    }
+    const [size, mtime] = await Promise.all([
+      this.storage.size(session, 'state.json'),
+      this.storage.mtime(session, 'state.json'),
+    ]);
+    return size === undefined && mtime === undefined ? undefined : `${size ?? -1}:${mtime ?? -1}`;
+  }
   private async isPrivate(scope: string): Promise<boolean> {
-    const session = scope.slice(0, scope.lastIndexOf('/agents/'));
-    return (await this.documents.get<SessionMeta>(session, 'state.json'))?.private === true;
+    const index = scope.lastIndexOf('/agents/');
+    const session = index >= 0 ? scope.slice(0, index) : scope;
+    const fingerprint = await this.stateFingerprint(session);
+    if (fingerprint === undefined) {
+      this.privacyCache.delete(session);
+      return false;
+    }
+    const cached = this.privacyCache.get(session);
+    if (cached?.fingerprint === fingerprint) return cached.value;
+    let flight = this.privacyFlights.get(session);
+    if (flight === undefined) {
+      flight = (async () => {
+        const value = (await this.documents.get<SessionMeta>(session, 'state.json'))?.private === true;
+        const after = await this.stateFingerprint(session);
+        if (after === fingerprint) this.privacyCache.set(session, { fingerprint, value });
+        else this.privacyCache.delete(session);
+        return value;
+      })().finally(() => {
+        if (this.privacyFlights.get(session) === flight) this.privacyFlights.delete(session);
+      });
+      this.privacyFlights.set(session, flight);
+    }
+    return flight;
   }
   private async commitWritten(position: AppendLogCommit, records: readonly UsageFact[], valid: boolean): Promise<void> {
     const mtimeMs = await this.storage.mtime(position.scope, position.key) ?? 0;

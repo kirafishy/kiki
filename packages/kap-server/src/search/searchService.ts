@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { watch, type FSWatcher } from 'node:fs';
 
 import {
@@ -212,10 +212,12 @@ export class GlobalSearchService implements IGlobalSearchService {
   private lastEmittedIndexState = '';
   private readonly sqliteHost: SqliteSearchHost;
   private readonly sqliteDisabled: boolean;
+  private readonly indexSubagents: boolean;
   private syncPromise: Promise<void> | null = null;
   private lastSyncStartedAt = 0;
   private lastFullSessionScanAt = 0;
   private lastSourceScanAt = 0;
+  private inventoryDirty = true;
   private summaries = new Map<string, SessionSummary>();
   private allSummaries = new Map<string, SessionSummary>();
   private readonly privateSessions = new Set<string>();
@@ -224,6 +226,9 @@ export class GlobalSearchService implements IGlobalSearchService {
   private sessionSourceMtimes = new Map<string, number>();
   private readonly dirtySessions = new Map<string, number>();
   private readonly forceSessionSyncs = new Set<string>();
+  private readonly branchAgentsCache = new Map<string, { revision: number; agents: ReadonlySet<string> }>();
+  private readonly branchAgentsFlights = new Map<string, Promise<ReadonlySet<string>>>();
+  private branchCacheRevision = 0;
   private watchRevision = 0;
   private sourceWatcher: FSWatcher | null = null;
   private readonly mirrorSubscription: IDisposable | undefined;
@@ -258,6 +263,7 @@ export class GlobalSearchService implements IGlobalSearchService {
     @ISessionIndexMirror private readonly mirror?: ISessionIndexMirror,
   ) {
     const search = this.config?.get<SearchConfig>('search');
+    this.indexSubagents = search?.index_subagents === true;
     const backend = process.env['KIKI_SEARCH_BACKEND'] ?? this.config?.get<string>(SEARCH_BACKEND_SECTION) ?? 'sqlite';
     this.sqliteDisabled = search?.enabled === false || process.env['KIKI_SEARCH_DISABLED'] === '1' ||
       (process.env['KIKI_DESKTOP_BUNDLED'] === '1' && !this.flags.enabled('desktop_search'));
@@ -266,7 +272,7 @@ export class GlobalSearchService implements IGlobalSearchService {
     }
     this.sqliteHost = new SqliteSearchHost({
       database: join(this.bootstrap.homeDir, 'search-index-v2', 'index.sqlite'),
-      indexSubagents: search?.index_subagents === true,
+      indexSubagents: this.indexSubagents,
       onStateChange: (snapshot) => {
         if (this.disposed) return;
         const state: SearchMessagesResponse['index_state'] = {
@@ -299,17 +305,75 @@ export class GlobalSearchService implements IGlobalSearchService {
       const watcher = watch(join(this.bootstrap.homeDir, this.bootstrap.scope('sessions')), {
         recursive: true,
         persistent: false,
-      }, (_event, filename) => {
-        const parts = filename?.toString().split(/[\\/]/);
-        if (parts === undefined || parts.length < 2) {
-          this.lastSourceScanAt = 0;
-        } else {
-          this.dirtySessions.set(parts[1]!, ++this.watchRevision);
-          if (parts.includes('agents') || parts.at(-1) === 'wire.jsonl') {
-            this.forceSessionSyncs.add(parts[1]!);
-          }
+      }, (event, filename) => {
+        const raw = filename?.toString();
+        const parts = raw === undefined || raw === '' ? undefined : raw.split(/[\\/]/);
+        if (parts !== undefined) {
+          const leaf = parts.at(-1)!;
+          if (leaf.includes('.tmp.') || leaf.endsWith('.tmp') || leaf.endsWith('.lock') || leaf.endsWith('.seal')) return;
         }
-        this.requestSync();
+        if (parts === undefined) {
+          this.inventoryDirty = true;
+          this.lastSourceScanAt = 0;
+          this.requestSync();
+          return;
+        }
+        if (parts.length < 2) {
+          if (event !== 'rename') return;
+          this.inventoryDirty = true;
+          this.lastSourceScanAt = 0;
+          this.requestSync();
+          return;
+        }
+        const sessionId = parts[1]!;
+        if (parts.length === 2) {
+          if (event !== 'rename') return;
+          this.invalidateBranchAgentsCache(sessionId);
+          this.dirtySessions.set(sessionId, ++this.watchRevision);
+          this.inventoryDirty = true;
+          this.requestSync();
+          return;
+        }
+        if (parts.length === 3 && (parts[2] === 'state.json' || parts[2] === 'wire.jsonl')) {
+          if (parts[2] === 'state.json') this.invalidateBranchAgentsCache(sessionId);
+          this.dirtySessions.set(sessionId, ++this.watchRevision);
+          this.forceSessionSyncs.add(sessionId);
+          this.requestSync();
+          return;
+        }
+        if (parts.length === 4 && parts[2] === 'session-meta' && parts[3] === 'state.json') {
+          this.invalidateBranchAgentsCache(sessionId);
+          this.dirtySessions.set(sessionId, ++this.watchRevision);
+          this.forceSessionSyncs.add(sessionId);
+          this.requestSync();
+          return;
+        }
+        if (
+          (parts.length === 4 && parts[2] === 'agents' && event === 'rename') ||
+          (parts.length === 5 && parts[2] === 'agents' && parts[4] === 'wire.jsonl')
+        ) {
+          const agentId = parts[3]!;
+          if (this.indexSubagents || agentId === 'main') {
+            this.dirtySessions.set(sessionId, ++this.watchRevision);
+            this.forceSessionSyncs.add(sessionId);
+            this.requestSync();
+            return;
+          }
+          const cached = this.branchAgentsCache.get(sessionId);
+          if (cached !== undefined) {
+            if (!cached.agents.has(agentId)) return;
+            this.dirtySessions.set(sessionId, ++this.watchRevision);
+            this.forceSessionSyncs.add(sessionId);
+            this.requestSync();
+            return;
+          }
+          void this.readBranchAgentsForWatch(parts[0]!, sessionId).then((agents) => {
+            if (!agents.has(agentId) || this.disposed) return;
+            this.dirtySessions.set(sessionId, ++this.watchRevision);
+            this.forceSessionSyncs.add(sessionId);
+            this.requestSync();
+          });
+        }
       });
       watcher.on('error', (error: unknown) => {
         this.log.warn('global search: session source watch failed; using periodic stat scan', {
@@ -324,6 +388,35 @@ export class GlobalSearchService implements IGlobalSearchService {
     } catch {
       this.nextWatchRetryAt = Date.now() + this.sourceStatIntervalMs;
     }
+  }
+
+  private invalidateBranchAgentsCache(sessionId: string): void {
+    this.branchCacheRevision += 1;
+    this.branchAgentsCache.delete(sessionId);
+    this.branchAgentsFlights.delete(sessionId);
+  }
+
+  private readBranchAgentsForWatch(workspaceId: string, sessionId: string): Promise<ReadonlySet<string>> {
+    const cached = this.branchAgentsCache.get(sessionId);
+    if (cached !== undefined) return Promise.resolve(cached.agents);
+    const existing = this.branchAgentsFlights.get(sessionId);
+    if (existing !== undefined) return existing;
+    const observedRevision = this.branchCacheRevision;
+    const dir = sessionDirOf(
+      this.bootstrap.homeDir,
+      workspacePersistenceScope(this.bootstrap.scope('sessions'), workspaceId),
+      sessionId,
+    );
+    const flight = readSessionBranchAgents(dir).then((agents) => {
+      if (this.branchCacheRevision === observedRevision && !this.disposed) {
+        this.branchAgentsCache.set(sessionId, { revision: observedRevision, agents });
+      }
+      return agents;
+    }).finally(() => {
+      if (this.branchAgentsFlights.get(sessionId) === flight) this.branchAgentsFlights.delete(sessionId);
+    });
+    this.branchAgentsFlights.set(sessionId, flight);
+    return flight;
   }
 
   private handleSessionMirrorChange(sessionId: string, isPrivate?: boolean): void {
@@ -428,6 +521,8 @@ export class GlobalSearchService implements IGlobalSearchService {
     this.sourceWatcher = null;
     this.privateSessions.clear();
     this.sessionMirrorRevisions.clear();
+    this.branchAgentsCache.clear();
+    this.branchAgentsFlights.clear();
     this.summaries.clear();
     this.allSummaries.clear();
     if (this.syncTimer !== null) {
@@ -532,18 +627,39 @@ export class GlobalSearchService implements IGlobalSearchService {
     }
     this.clearSessionIndexStatusWaiter();
     const dirtyAtStart = new Map(this.dirtySessions);
+    const forcedAtStart = new Set(this.forceSessionSyncs);
     const privateRevisionAtStart = this.privateRevision;
-    const sessions = await this.listSessionsForSync();
+    const previousIndexable = this.summaries;
+    const plan = await this.listSessionsForSync(dirtyAtStart, forcedAtStart);
     if (this.disposed) return;
+    const { sessions, fullSync, changedIds } = plan;
     this.allSummaries = new Map(sessions.map((s) => [s.id, s]));
     if (privateRevisionAtStart === this.privateRevision) {
       this.privateSessions.clear();
       for (const summary of sessions) if (summary.private === true) this.privateSessions.add(summary.id);
     }
     const indexable = sessions.filter((summary) => summary.private !== true && !this.privateSessions.has(summary.id));
-    this.summaries = new Map(indexable.map((summary) => [summary.id, summary]));
+    const nextIndexable = new Map(indexable.map((summary) => [summary.id, summary]));
+    this.summaries = nextIndexable;
     this.lastSyncStartedAt = Date.now();
-    this.sqliteHost.sync(indexable.map((summary) => this.toSyncInput(summary)));
+    if (fullSync) {
+      this.sqliteHost.sync(indexable.map((summary) => this.toSyncInput(summary)));
+    } else {
+      for (const id of previousIndexable.keys()) {
+        if (!nextIndexable.has(id)) this.sqliteHost.retireSession(id);
+      }
+      for (const [id, summary] of nextIndexable) {
+        const prev = previousIndexable.get(id);
+        if (
+          prev === undefined ||
+          changedIds.has(id) ||
+          prev.title !== summary.title ||
+          prev.workspaceId !== summary.workspaceId
+        ) {
+          this.sqliteHost.syncSession(this.toSyncInput(summary));
+        }
+      }
+    }
     this.ensureSourceWatcher();
     for (const [id, revision] of dirtyAtStart) {
       if (this.dirtySessions.get(id) === revision) {
@@ -553,27 +669,40 @@ export class GlobalSearchService implements IGlobalSearchService {
     }
   }
 
-  private async listSessionsForSync(): Promise<SessionSummary[]> {
+  private async listSessionsForSync(
+    dirtyAtStart: ReadonlyMap<string, number>,
+    forcedAtStart: ReadonlySet<string>,
+  ): Promise<{ sessions: SessionSummary[]; fullSync: boolean; changedIds: ReadonlySet<string> }> {
     if (
+      this.inventoryDirty ||
       this.allSummaries.size === 0 ||
       Date.now() - this.lastFullSessionScanAt >= this.fullSessionScanIntervalMs
     ) {
-      return this.refreshFullSessionInventory();
+      return { sessions: await this.refreshFullSessionInventory(), fullSync: true, changedIds: new Set() };
     }
     const count = await this.sessionIndex.count({});
-    if (count !== this.allSummaries.size) return this.refreshFullSessionInventory();
+    if (count !== this.allSummaries.size) {
+      return { sessions: await this.refreshFullSessionInventory(), fullSync: true, changedIds: new Set() };
+    }
     const fullStat = Date.now() - this.lastSourceScanAt >= this.sourceStatIntervalMs;
     const candidates = [...this.allSummaries.values()].filter(
-      (summary) => fullStat || this.dirtySessions.has(summary.id),
+      (summary) => fullStat || dirtyAtStart.has(summary.id) || forcedAtStart.has(summary.id),
     );
     const sampled = await this.readSessionSourceMtimes(candidates);
-    if (sampled === undefined) return this.refreshFullSessionInventory();
+    const changedIds = new Set<string>([...dirtyAtStart.keys(), ...forcedAtStart]);
     const merged = new Map(this.allSummaries);
     for (const [id, mtimeMs] of sampled) {
-      if (this.sessionSourceMtimes.get(id) === mtimeMs && !this.dirtySessions.has(id)) continue;
+      const previousMtime = this.sessionSourceMtimes.get(id);
+      if (mtimeMs < 0 && (previousMtime === undefined || previousMtime >= 0)) {
+        return { sessions: await this.refreshFullSessionInventory(), fullSync: true, changedIds: new Set() };
+      }
+      if (previousMtime === mtimeMs && !dirtyAtStart.has(id) && !forcedAtStart.has(id)) continue;
       const summary = await this.sessionIndex.get(id);
-      if (summary === undefined) return this.refreshFullSessionInventory();
+      if (summary === undefined) {
+        return { sessions: await this.refreshFullSessionInventory(), fullSync: true, changedIds: new Set() };
+      }
       merged.set(id, summary);
+      changedIds.add(id);
     }
     const newest = [...this.allSummaries.values()].reduce((current, summary) =>
       compareSessionRecency(summary, current) > 0 ? summary : current,
@@ -590,34 +719,48 @@ export class GlobalSearchService implements IGlobalSearchService {
           reachedWatermark = true;
           break;
         }
-        merged.set(summary.id, summary);
+        if (!merged.has(summary.id)) {
+          return { sessions: await this.refreshFullSessionInventory(), fullSync: true, changedIds: new Set() };
+        }
+        const prev = merged.get(summary.id);
+        if (
+          prev === undefined ||
+          prev.updatedAt !== summary.updatedAt ||
+          prev.title !== summary.title ||
+          prev.workspaceId !== summary.workspaceId ||
+          prev.private !== summary.private
+        ) {
+          merged.set(summary.id, summary);
+          changedIds.add(summary.id);
+        }
       }
       cursor = page.nextCursor;
     } while (!reachedWatermark && cursor !== undefined);
-    if (!reachedWatermark) return this.refreshFullSessionInventory();
+    if (!reachedWatermark) {
+      return { sessions: await this.refreshFullSessionInventory(), fullSync: true, changedIds: new Set() };
+    }
     for (const [id, mtimeMs] of sampled) this.sessionSourceMtimes.set(id, mtimeMs);
     if (fullStat) this.lastSourceScanAt = Date.now();
-    return [...merged.values()];
+    return { sessions: [...merged.values()], fullSync: fullStat, changedIds };
   }
 
   private async refreshFullSessionInventory(): Promise<SessionSummary[]> {
     const sessions = await this.listAllSessions();
-    const mtimes = await this.readSessionSourceMtimes(sessions);
-    this.sessionSourceMtimes = mtimes ?? new Map();
-    this.lastSourceScanAt = mtimes === undefined ? 0 : Date.now();
+    this.sessionSourceMtimes = await this.readSessionSourceMtimes(sessions);
+    this.lastSourceScanAt = Date.now();
     this.lastFullSessionScanAt = Date.now();
+    this.inventoryDirty = false;
     return sessions;
   }
 
   private async readSessionSourceMtimes(
     sessions: readonly SessionSummary[],
-  ): Promise<Map<string, number> | undefined> {
-    const rows = await mapConcurrent(sessions, SESSION_MTIME_CONCURRENCY, async (summary) => {
-      const mtimeMs = await sessionSourceMtime(this.toSyncInput(summary).dir);
-      return mtimeMs === undefined ? undefined : [summary.id, mtimeMs] as const;
-    });
-    if (rows.some((row) => row === undefined)) return undefined;
-    return new Map(rows as Array<readonly [string, number]>);
+  ): Promise<Map<string, number>> {
+    const rows = await mapConcurrent(sessions, SESSION_MTIME_CONCURRENCY, async (summary) => [
+      summary.id,
+      await sessionSourceMtime(this.toSyncInput(summary).dir),
+    ] as const);
+    return new Map(rows);
   }
 
   private async listAllSessions(): Promise<SessionSummary[]> {
@@ -833,6 +976,11 @@ export class GlobalSearchService implements IGlobalSearchService {
       for (const summary of sessions) if (summary.private === true) this.privateSessions.add(summary.id);
       const indexable = sessions.filter((summary) => summary.private !== true);
       this.summaries = new Map(indexable.map((summary) => [summary.id, summary]));
+      this.sessionSourceMtimes = await this.readSessionSourceMtimes(sessions);
+      this.lastSourceScanAt = Date.now();
+      this.lastFullSessionScanAt = Date.now();
+      this.inventoryDirty = false;
+      this.ensureSourceWatcher();
       const stats = await this.sqliteHost.reindex(indexable.map((summary) => this.toSyncInput(summary)));
       this.lastRefreshError = null;
       return stats;
@@ -872,14 +1020,42 @@ export class GlobalSearchService implements IGlobalSearchService {
   }
 }
 
-async function sessionSourceMtime(sessionDir: string): Promise<number | undefined> {
+async function sessionSourceMtime(sessionDir: string): Promise<number> {
   for (const path of [join(sessionDir, 'state.json'), join(sessionDir, 'session-meta', 'state.json')]) {
     try {
       return (await stat(path)).mtimeMs;
     } catch {
     }
   }
-  return undefined;
+  try {
+    return (await stat(sessionDir)).isDirectory() ? 0 : -1;
+  } catch {
+    return -1;
+  }
+}
+
+async function readSessionBranchAgents(sessionDir: string): Promise<ReadonlySet<string>> {
+  for (const path of [join(sessionDir, 'state.json'), join(sessionDir, 'session-meta', 'state.json')]) {
+    try {
+      const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
+      if (typeof parsed !== 'object' || parsed === null || !('agents' in parsed) ||
+          typeof parsed.agents !== 'object' || parsed.agents === null) {
+        return new Set();
+      }
+      const out = new Set<string>();
+      for (const [agentId, raw] of Object.entries(parsed.agents as Record<string, unknown>)) {
+        if (typeof raw === 'object' && raw !== null && 'labels' in raw &&
+            typeof raw.labels === 'object' && raw.labels !== null &&
+            (raw.labels as Record<string, unknown>)['branch'] === 'true') {
+          out.add(agentId);
+        }
+      }
+      return out;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return new Set();
+    }
+  }
+  return new Set();
 }
 
 async function mapConcurrent<T, R>(

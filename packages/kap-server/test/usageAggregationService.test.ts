@@ -2499,4 +2499,48 @@ describe('SQLite Usage history source lifecycle', () => {
     expect(f.readBytes.get(first)).toBe(bytes);
     resumed.dispose();
   });
+
+  it('invalidates only the changed agent metadata and refreshes import progress incrementally on agent updates', async () => {
+    const changes = new Emitter<UsageSourceChange>();
+    const s1 = summary('s1', 'w');
+    const s2 = summary('s2', 'w');
+    const main1 = 'sessions/w/s1/agents/main';
+    const sub1 = 'sessions/w/s1/agents/sub-1';
+    const main2 = 'sessions/w/s2/agents/main';
+    const f = fixture(
+      [s1, s2],
+      { [main1]: [usageRecord(1, 1)], [sub1]: [usageRecord(2, 1)], [main2]: [usageRecord(3, 1)] },
+      Date.now,
+      {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { ready: true, onDidChange: changes.event },
+    );
+    f.setAgentIds(['main', 'sub-1']);
+    try {
+      const initial = await query(f.service);
+      expect(initial.reliability.complete).toBe(true);
+      await Reflect.get(f.service, 'progressInventory');
+
+      const listRecent = vi.spyOn(f.core.accessor.get(ISessionIndex), 'listRecent');
+      f.agentLists.clear();
+      f.sourceProbes.clear();
+      f.setWire(sub1, [usageRecord(2, 1), usageRecord(4, 2)]);
+      changes.fire({ kind: 'agent', sessionKey: 'w\0s1', agentId: 'sub-1' });
+
+      const next = await query(f.service);
+      await Reflect.get(f.service, 'progressInventory');
+      expect(next.reliability.complete).toBe(true);
+      expect(next.summary.tokens.output).toBe(4);
+      expect(listRecent).not.toHaveBeenCalled();
+      expect([...f.agentLists.keys()]).toEqual(['sessions/w/s1/agents']);
+      expect([...f.sourceProbes.keys()]).toEqual([sub1]);
+    } finally {
+      f.service.dispose();
+      changes.dispose();
+    }
+  });
 });

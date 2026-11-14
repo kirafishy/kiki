@@ -48,12 +48,14 @@ function stubWorkspaceDirs(): IWorkspaceDirs {
 interface FakeWatch {
   readonly service: IHostFsWatchService;
   readonly watchCalls: string[];
+  readonly lastOptions: () => Parameters<IHostFsWatchService['watch']>[1];
   fire: (rel: string, action: HostFsChange['action'], kind?: HostFsChange['kind']) => void;
   readonly disposedCount: () => number;
 }
 
 function fakeHostFsWatch(): FakeWatch {
   const watchCalls: string[] = [];
+  let latestOptions: Parameters<IHostFsWatchService['watch']>[1];
   let listener: ((e: HostFsChange) => void) | undefined;
   let disposedCount = 0;
   const handle: IHostFsWatchHandle = {
@@ -69,14 +71,16 @@ function fakeHostFsWatch(): FakeWatch {
   };
   const service: IHostFsWatchService = {
     _serviceBrand: undefined,
-    watch: (path) => {
+    watch: (path, options) => {
       watchCalls.push(path);
+      latestOptions = options;
       return handle;
     },
   };
   return {
     service,
     watchCalls,
+    lastOptions: () => latestOptions,
     fire: (rel, action, kind = 'file') =>
       listener?.({ path: join(WORK_DIR, rel), action, kind }),
     disposedCount: () => disposedCount,
@@ -284,5 +288,20 @@ describe('WorkspaceFsWatchService', () => {
     expect(eventsB).toHaveLength(1);
     expect(eventsA[0]?.truncated).toBe(true);
     expect(eventsB[0]?.truncated).toBe(true);
+  });
+
+  it('passes a gitignore-backed ignored filter to hostFsWatch to prune .git and node_modules traversal', async () => {
+    const { svc, watch } = makeWorkspace('node_modules\nbuild/\n');
+    const sub = svc.subscribe();
+    sub.setWatchedPaths(['.']);
+    await Promise.resolve();
+    const ignored = watch.lastOptions()?.ignored;
+    expect(ignored).toBeTypeOf('function');
+    expect(ignored!(WORK_DIR)).toBe(false);
+    expect(ignored!(join(WORK_DIR, '.git'))).toBe(true);
+    expect(ignored!(join(WORK_DIR, '.git', 'HEAD'))).toBe(true);
+    expect(ignored!(join(WORK_DIR, 'node_modules'))).toBe(true);
+    expect(ignored!(join(WORK_DIR, 'node_modules', 'pkg', 'index.js'))).toBe(true);
+    expect(ignored!(join(WORK_DIR, 'src', 'index.ts'))).toBe(false);
   });
 });

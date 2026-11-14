@@ -379,7 +379,7 @@ export class SqliteSearchHost {
         if (targeted?.revision !== message.revision) return;
         this.targeted.delete(message.sessionId);
         this.pending.delete(message.sessionId);
-        if (targeted.session === undefined && message.missing) this.known.delete(message.sessionId);
+        if (message.missing) this.known.delete(message.sessionId);
       } else if (message.type === 'synced') {
         if (message.revision !== this.inventoryRevision) return;
         if (this.reason === 'disk_low' || this.reason === 'indexer_backoff' ||
