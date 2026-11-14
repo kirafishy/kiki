@@ -45,8 +45,9 @@ export class PromptCacheWindow {
     const projected: Message[] = [];
     let start = 0;
     for (const update of this.extensionUpdates) {
-      projected.push(...messages.slice(start, update.index), update.message);
-      start = update.index;
+      const at = Math.min(Math.max(start, update.index), messages.length);
+      projected.push(...messages.slice(start, at), update.message);
+      start = at;
     }
     projected.push(...messages.slice(start));
     return { text: this.extension.baseline, messages: projected };

@@ -533,7 +533,7 @@ describe('thinking-only continuation', () => {
         const attempts = mode === 'lower-budget' ? 2 : 3;
         expect(bodies).toHaveLength(attempts);
         expect(executedAtRequest).toEqual(mode === 'recover' ? [0, 0, 1] : Array.from({ length: attempts }, () => 0));
-        expect(bodies[1]).toEqual(bodies[0]);
+        expect(bodies[1]).toEqual({ ...(bodies[0] as Record<string, unknown>), tool_choice: { type: 'auto' } });
         const discarded = local.allEvents.filter(event => event.type === '[rpc]' && event.event === 'response.attempt.discarded')
           .map(event => event.args as { toolCallIds: string[] });
         expect(discarded).toHaveLength(mode === 'recover' ? 1 : attempts - 1);
