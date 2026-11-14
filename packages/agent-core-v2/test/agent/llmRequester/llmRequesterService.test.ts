@@ -36,6 +36,8 @@ import {
   type AgentLLMRequestSource,
 } from '#/agent/llmRequester/llmRequester';
 import { IAgentTokenCountingService } from '#/agent/tokenCounting/tokenCounting';
+import { AgentTokenCountingService } from '#/agent/tokenCounting/tokenCountingService';
+import { contextMemoryKey } from '#/agent/contextMemory/contextOps';
 import { IAgentProfileService } from '#/agent/profile/profile';
 import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
 import { IAgentStateService } from '#/agent/state/agentState';
@@ -63,6 +65,9 @@ import { INbSearchService } from '#/app/nbSearch/nbSearch';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import type { Event2 } from '#/app/event/event2';
 import { IEventBus } from '#/app/event/eventBus';
+import { EventBusService } from '#/app/event/eventBusService';
+import { IPluginExtensionPortRegistryReader } from '#/app/pluginExtensionPorts/pluginExtensionPortRegistry';
+import { ContextSpliced } from '#/agent/contextMemory/contextEvents';
 import {
   APIConnectionError,
   APIContextOverflowError,
@@ -270,6 +275,9 @@ function createService(
     readonly sectionChanges?: Emitter<ConfigChangedEvent>;
     readonly catalogReads?: { value: number };
     readonly transportModel?: { value: Model };
+    readonly extensions?: Partial<IPluginExtensionPortRegistryReader>;
+    readonly bindingRevision?: { value: string };
+    readonly realTokenCounting?: boolean;
   } = {},
 ) {
   const ix = disposables.add(new TestInstantiationService());
@@ -303,8 +311,8 @@ function createService(
       customPromptVariables(options.promptConfig?.value.variables),
     ),
     getPromptFieldSnapshot: () => promptFields(),
-    getCognitionSnapshot: () => ({ position: 'main', modelAlias: selectedModelAlias(), revision: 0, contentRevision: 'fixture' }),
-    getCognitionBinding: async () => ({ position: 'main', modelAlias: selectedModelAlias(), revision: 0, contentRevision: 'fixture' }),
+    getCognitionSnapshot: () => ({ position: 'main', modelAlias: selectedModelAlias(), revision: 0, contentRevision: 'fixture', bindingRevision: options.bindingRevision?.value }),
+    getCognitionBinding: async () => ({ position: 'main', modelAlias: selectedModelAlias(), revision: 0, contentRevision: 'fixture', bindingRevision: options.bindingRevision?.value }),
     refreshSystemPrompt: options.promptRefresh ?? (async () => undefined),
     preparePromptConfiguration: (() => {
       let signature = '';
@@ -390,11 +398,10 @@ function createService(
   };
   const testSnapshot = Object.freeze({}) as MediaStripSnapshot;
   const events: Event2[] = [];
-  const eventBus: IEventBus = {
-    _serviceBrand: undefined,
-    publish: (event) => events.push(event),
-    subscribe: () => toDisposable(() => {}),
-  };
+  ix.set(IEventBus, new SyncDescriptor(EventBusService));
+  const eventBus = ix.get(IEventBus);
+  disposables.add(eventBus.subscribe((event) => events.push(event)));
+  if (options.extensions !== undefined) ix.stub(IPluginExtensionPortRegistryReader, { activeStreamTaps: () => [], ...options.extensions });
 
   ix.stub(IAgentContextMemoryService, context);
   ix.stub(ISessionContext, { sessionId });
@@ -502,11 +509,19 @@ function createService(
   ix.stub(IAgentScopeContext, { agentId, scope: () => `agents/${agentId}` });
   registerTestEventDispatcher(ix);
   ix.get(IAgentStateService).contributeState(contextWindowEpochKey);
+  if (options.realTokenCounting) {
+    ix.get(IAgentStateService).contributeState(contextMemoryKey);
+    ix.get(IAgentStateService).set(contextMemoryKey, (options.contextMessages ?? history) as ContextMessage[]);
+    ix.set(IAgentTokenCountingService, new SyncDescriptor(AgentTokenCountingService));
+  }
   ix.set(IAgentLLMRequesterService, new SyncDescriptor(AgentLLMRequesterService));
   ix.stub(IAppendLogStore, { append: () => {}, flush: async () => {} });
 
   return {
     identityCatalog: catalog,
+    eventBus,
+    states: ix.get(IAgentStateService),
+    tokenCounting: ix.get(IAgentTokenCountingService),
     log,
     service: ix.get(IAgentLLMRequesterService),
     dispatcher: ix.get(IEventDispatcher),
@@ -1075,6 +1090,182 @@ describe('AgentLLMRequesterService native tool and shared prompt preparation', (
     expect(JSON.stringify(inputs)).not.toContain('SEARCH_ONLY');
     expect(prepare).not.toHaveBeenCalled();
     expect(refresh).toHaveBeenCalledTimes(2);
+  });
+
+  it('freezes description-only changes across turns but refreshes structural tool changes', async () => {
+    const inputs: ModelRequestInput[] = [];
+    const tools: ToolInfo[] = [{ name: 'Lookup', source: 'builtin', description: 'initial description', parameters: { type: 'object' } }];
+    const { service } = createService(createRequester({ value: 0 }, null, [], inputs), undefined, { tools });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+    tools[0] = { ...tools[0]!, description: 'refreshed capability description' };
+    await service.request({ source: { type: 'turn', turnId: 1, step: 2 } });
+    await service.request({ source: { type: 'turn', turnId: 2, step: 1 } });
+    expect(inputs[1]?.tools).toBe(inputs[0]?.tools);
+    expect(inputs[2]?.tools).toBe(inputs[0]?.tools);
+    expect(JSON.stringify(inputs[2]?.tools)).toBe(JSON.stringify(inputs[0]?.tools));
+    tools[0]!.parameters!['required'] = ['query'];
+    await service.request({ source: { type: 'turn', turnId: 2, step: 2 } });
+    expect(inputs[3]?.tools).toBe(inputs[0]?.tools);
+    expect(inputs[0]?.tools?.[0]?.parameters).toEqual({ type: 'object' });
+    await service.request({ source: { type: 'turn', turnId: 3, step: 1 } });
+    expect(inputs[4]?.tools?.[0]).toMatchObject({ description: 'refreshed capability description', parameters: { required: ['query'] } });
+    tools.push({ name: 'WriteRecord', source: 'builtin', description: 'Write', parameters: {} });
+    await service.request({ source: { type: 'turn', turnId: 4, step: 1 } });
+    expect(inputs[5]?.tools?.map((tool) => tool.name)).toEqual(['Lookup', 'WriteRecord']);
+    tools.shift();
+    await service.request({ source: { type: 'turn', turnId: 5, step: 1 } });
+    expect(inputs[6]?.tools?.map((tool) => tool.name)).toEqual(['WriteRecord']);
+  });
+
+  it.each(['compaction', 'clear', 'profile'] as const)('refreshes frozen extension and tool baselines after %s, even within a turn', async (reset) => {
+    const inputs: ModelRequestInput[] = [];
+    const bindingRevision = { value: 'binding-1' };
+    let extension = 'initial extension state';
+    const tools: ToolInfo[] = [{ name: 'Lookup', source: 'builtin', description: 'initial description', parameters: {} }];
+    const { service, states, eventBus } = createService(createRequester({ value: 0 }, null, [], inputs), undefined, {
+      tools, bindingRevision,
+      extensions: { renderPromptSections: async () => ({ text: extension, suppressRuntimeContext: false }) },
+    });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+    tools[0] = { ...tools[0]!, description: 'new description' };
+    extension = 'new extension state';
+    if (reset === 'compaction') states.set(contextWindowEpochKey, 1);
+    if (reset === 'clear') eventBus.publish(new ContextSpliced({ start: 0, deleteCount: 1, messages: [] }));
+    if (reset === 'profile') bindingRevision.value = 'binding-2';
+    await service.request({ source: { type: 'turn', turnId: 1, step: 2 } });
+    expect(inputs[1]?.systemPrompt).toBe('system\n\nnew extension state');
+    expect(inputs[1]?.messages).toEqual(history);
+    expect(inputs[1]?.tools?.[0]?.description).toBe('new description');
+  });
+
+  it('refreshes tool prompt overrides between turns without thawing the active turn', async () => {
+    const inputs: ModelRequestInput[] = [];
+    const promptConfig: { value: PromptConfig } = { value: { variables: { guidance: 'first' }, overrides: { fields: { 'tool.web-search.guidance': '${guidance}' } } } };
+    const { service } = createService(createRequester({ value: 0 }, null, [], inputs), undefined, {
+      promptConfig, tools: [{ name: 'WebSearch', source: 'builtin', description: 'Search', parameters: {} }],
+    });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+    promptConfig.value = { ...promptConfig.value, variables: { guidance: 'second' } };
+    await service.request({ source: { type: 'turn', turnId: 1, step: 2 } });
+    await service.request({ source: { type: 'turn', turnId: 2, step: 1 } });
+    expect(inputs[1]?.tools).toBe(inputs[0]?.tools);
+    expect(inputs[2]?.tools?.[0]?.description).toContain('second');
+    promptConfig.value = { ...promptConfig.value, overrides: { fields: { 'tool.web-search.guidance': 'replacement' } } };
+    await service.request({ source: { type: 'turn', turnId: 3, step: 1 } });
+    expect(inputs[3]?.tools?.[0]?.description).toContain('replacement');
+  });
+
+  it.each(['anthropic', 'openai', 'openai_responses', 'google-genai'] as const)('keeps extension updates chronological and tool results adjacent on %s', async (protocol) => {
+    const inputs: ModelRequestInput[] = [];
+    const contextMessages = structuredClone(history);
+    let text = 'Device: Example Phone';
+    const renderPromptSections = vi.fn(async () => ({ text, suppressRuntimeContext: false }));
+    const { service } = createService(createRequester({ value: 0 }, null, [], inputs, { protocol }), undefined, {
+      contextMessages, extensions: { renderPromptSections },
+    });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+    contextMessages.push({ role: 'assistant', content: [], toolCalls: [
+      { type: 'function', id: 'call-first', name: 'Read', arguments: '{}' },
+      { type: 'function', id: 'call-second', name: 'Read', arguments: '{}' },
+    ] }, { role: 'tool', content: [{ type: 'text', text: 'first result' }], toolCallId: 'call-first', toolCalls: [] },
+    { role: 'tool', content: [{ type: 'text', text: 'second result' }], toolCallId: 'call-second', toolCalls: [] });
+    const original = structuredClone(contextMessages);
+    text = 'Device: Example Model Code';
+    await service.request({ source: { type: 'turn', turnId: 1, step: 2 } });
+    const updated = inputs[1]!;
+    expect(updated.systemPrompt).toBe(inputs[0]?.systemPrompt);
+    expect(updated.messages.slice(0, original.length)).toEqual(original);
+    expect(updated.messages.map((message) => message.role)).toEqual(['user', 'assistant', 'tool', 'tool', 'user']);
+    expect(updated.messages.at(-1)?.content[0]).toMatchObject({ type: 'text', text: expect.stringContaining('Device: Example Model Code') });
+    expect(contextMessages).toEqual(original);
+    contextMessages.push({ role: 'assistant', content: [{ type: 'text', text: 'done' }], toolCalls: [] });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 3 } });
+    expect(inputs[2]?.messages.slice(0, updated.messages.length)).toEqual(updated.messages);
+    expect(inputs[2]?.messages).toHaveLength(contextMessages.length + 1);
+    contextMessages.push({ role: 'user', content: [{ type: 'text', text: 'next turn' }], toolCalls: [] });
+    text = 'Device: Example Phone';
+    await service.request({ source: { type: 'turn', turnId: 2, step: 1 } });
+    expect(inputs[3]?.systemPrompt).toBe(inputs[0]?.systemPrompt);
+    expect(inputs[3]?.messages.slice(0, inputs[2]!.messages.length)).toEqual(inputs[2]?.messages);
+    expect(inputs[3]?.messages.at(-1)?.content[0]).toMatchObject({ type: 'text', text: expect.stringContaining('Device: Example Phone') });
+    expect(inputs[3]?.messages).toHaveLength(contextMessages.length + 2);
+    expect(renderPromptSections).toHaveBeenCalledTimes(4);
+  });
+
+  it('keeps extension reminders before the active step placeholder when it becomes a tool-call response', async () => {
+    const inputs: ModelRequestInput[] = [];
+    const contextMessages = structuredClone(history);
+    let text = 'initial state';
+    const { service } = createService(createRequester({ value: 0 }, null, [], inputs), undefined, {
+      contextMessages, extensions: { renderPromptSections: async () => ({ text, suppressRuntimeContext: false }) },
+    });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+    contextMessages.push({ role: 'assistant', content: [], toolCalls: [], partial: true });
+    text = 'updated state';
+    await service.request({ source: { type: 'turn', turnId: 1, step: 2 } });
+    const prefix = structuredClone(inputs[1]!.messages);
+    contextMessages[1] = { role: 'assistant', content: [], toolCalls: [
+      { type: 'function', id: 'call-result', name: 'Read', arguments: '{}' },
+    ] };
+    contextMessages.push({ role: 'tool', toolCallId: 'call-result', content: [{ type: 'text', text: 'result' }], toolCalls: [] },
+      { role: 'assistant', content: [], toolCalls: [], partial: true });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 3 } });
+    expect(inputs[2]?.messages.slice(0, prefix.length)).toEqual(prefix);
+    expect(inputs[2]?.messages.map((message) => message.role)).toEqual(['user', 'user', 'assistant', 'tool']);
+    expect(inputs[2]?.messages[1]?.content[0]).toMatchObject({ type: 'text', text: expect.stringContaining('updated state') });
+    expect(contextMessages).toHaveLength(4);
+  });
+
+  it('records full provider usage against canonical context anchors after request-only extension updates', async () => {
+    const inputs: ModelRequestInput[] = [];
+    const requester = createRequester({ value: 0 }, null, [], inputs);
+    const original = requester.request.bind(requester);
+    let tokens = 100;
+    requester.request = async function* (...args) {
+      yield { type: 'usage', usage: { inputOther: tokens, output: 2, inputCacheRead: 0, inputCacheCreation: 0 }, model: 'wire-model' };
+      yield* original(...args);
+    };
+    const params = captureRequestParams(requester);
+    let text = 'initial state';
+    const { service, tokenCounting } = createService(requester, undefined, {
+      realTokenCounting: true,
+      extensions: { renderPromptSections: async () => ({ text, suppressRuntimeContext: false }) },
+    });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+    expect(tokenCounting.get().measured).toBe(102);
+    text = 'updated state';
+    tokens = 200;
+    await service.request({ source: { type: 'turn', turnId: 1, step: 2 } });
+    expect(tokenCounting.get().measured).toBe(202);
+    tokens = 300;
+    await service.request({ source: { type: 'turn', turnId: 2, step: 1 } });
+    expect(tokenCounting.get().measured).toBe(302);
+    expect(params[2]?.usedContextTokens).toBe(202);
+    expect(inputs[2]?.messages).toHaveLength(history.length + 1);
+  });
+
+  it('surfaces extension activation and removal while leaving operation and explicit prompt overrides live', async () => {
+    const inputs: ModelRequestInput[] = [];
+    let text = '';
+    const { service } = createService(createRequester({ value: 0 }, null, [], inputs), undefined, {
+      extensions: { renderPromptSections: async () => ({ text, suppressRuntimeContext: false }) },
+    });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+    text = 'Extension enabled';
+    await service.request({ source: { type: 'turn', turnId: 2, step: 1 } });
+    expect(inputs[1]?.systemPrompt).toBe('system');
+    expect(inputs[1]?.messages.at(-1)?.content[0]).toMatchObject({ type: 'text', text: expect.stringContaining(text) });
+    await service.request({ source: { type: 'operation', requestKind: 'test' } });
+    expect(inputs[2]?.systemPrompt).toBe('system\n\nExtension enabled');
+    expect(inputs[2]?.messages).toEqual(history);
+    await service.request({ systemPrompt: 'explicit', source: { type: 'turn', turnId: 2, step: 2 } });
+    expect(inputs[3]?.systemPrompt).toBe('explicit\n\nExtension enabled');
+    expect(inputs[3]?.messages).toEqual(history);
+    text = '';
+    await service.request({ source: { type: 'turn', turnId: 2, step: 3 } });
+    expect(inputs[4]?.systemPrompt).toBe('system');
+    expect(inputs[4]?.messages.at(-1)?.content[0]).toMatchObject({ type: 'text', text: expect.stringContaining('No extension prompt sections are active.') });
+    expect(inputs[4]?.messages.slice(0, inputs[1]!.messages.length)).toEqual(inputs[1]?.messages);
   });
 
   it('keeps constructed tools[] and system prompt byte-identical across real SSH host CRUD', async () => {
@@ -2056,6 +2247,47 @@ describe('AgentLLMRequesterService interrupted response retry', () => {
     })).rejects.toBe(error);
     expect(calls.value).toBe(1);
     expect(onAttemptRetry).not.toHaveBeenCalled();
+  });
+
+  it.each(['default', 'none', 'function', 'no-tools', 'interruption', 'missing-terminal', 'native-request', 'native-model'] as const)('sets retry tool choice only for an implicit malformed call with tools: %s', async mode => {
+    const attempts: ModelRequestParams[] = [];
+    const calls = { value: 0 };
+    const error = mode === 'interruption' ? new APIConnectionError('socket closed')
+      : markProviderEventError(new ChatProviderError('fixture failure'), mode === 'missing-terminal'
+        ? 'antigravity_missing_terminal' : 'antigravity_malformed_function_call');
+    const base = createRequester(calls, error, [], undefined, {
+      requestParams: mode === 'native-model' ? { tool_choice: 'required' } : undefined,
+    });
+    const requester: ModelRequester = { ...base, request: async function* (input, signal, params) {
+      attempts.push(params);
+      yield* base.request(input, signal, params);
+    } };
+    const toolChoice = mode === 'none' ? 'none' : mode === 'function' ? { type: 'function' as const, name: 'Lookup' } : undefined;
+    const { service } = createService(requester, undefined, {
+      requestParams: { toolChoice, requestParams: mode === 'native-request' ? { tool_choice: 'required' } : undefined },
+      retryConfig: { policies: [{ match: '.*', retry: true, backoff: 1 }] },
+    });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 }, onAttemptRetry: () => {},
+      tools: mode === 'no-tools' ? [] : [{ name: 'Lookup', description: 'Look up', parameters: {} }] });
+    expect(attempts).toHaveLength(2);
+    expect(attempts[0]?.toolChoice).toEqual(toolChoice);
+    expect(attempts[1]?.toolChoice).toEqual(mode === 'default' ? 'auto' : toolChoice);
+  });
+
+  it('honors an explicit per-request choice over the configured choice during retry', async () => {
+    const attempts: ModelRequestParams[] = [];
+    const base = createRequester({ value: 0 }, markProviderEventError(new ChatProviderError('malformed'), 'antigravity_malformed_function_call'));
+    const requester: ModelRequester = { ...base, request: async function* (input, signal, params) {
+      attempts.push(params);
+      yield* base.request(input, signal, params);
+    } };
+    const { service } = createService(requester, undefined, {
+      requestParams: { toolChoice: 'required' },
+      retryConfig: { policies: [{ match: '.*', retry: true, backoff: 1 }] },
+    });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 }, onAttemptRetry: () => {},
+      toolChoice: 'none', tools: [{ name: 'Lookup', description: 'Look up', parameters: {} }] });
+    expect(attempts.map(attempt => attempt.toolChoice)).toEqual(['none', 'none']);
   });
 
   it.each(['local', 'executed', 'policy', 'never', 'operation', 'no-retraction'] as const)('honors %s for a malformed function-call failure', async (mode) => {
@@ -3119,11 +3351,13 @@ describe.each(['anthropic', 'google-genai'] as const)('%s malformed function-cal
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
     const model = { ...createRequester({ value: 0 }, null).model, protocol, baseUrl,
+      capabilities: { ...capabilities, thinking: true, tool_use: true, max_context_tokens: 128000 },
       authProvider: { getAuth: async () => ({ apiKey: 'YOUR_API_KEY' }) } };
-    const options = { model: model.name, baseUrl, apiKey: 'YOUR_API_KEY' };
+    const options = { model: model.name, baseUrl, apiKey: 'YOUR_API_KEY', adaptiveThinking: false };
     const provider = protocol === 'google-genai' ? new GoogleGenAIChatProvider(options) : new AnthropicChatProvider(options);
     const requester = new ModelRequesterImpl(model, { createChatProvider: () => provider } as unknown as IProtocolAdapterRegistry);
     const { service, events } = createService(requester, undefined, {
+      requestParams: { thinkingEffort: 'high' },
       env: { [KIKI_INFINITE_RETRY_ENV]: '1' }, retryConfig: { maxAttempts: 5, policies: [{ match: '.*', retry: true, backoff: 1 }] },
     });
     const visible: StreamedMessagePart[] = [];
@@ -3133,6 +3367,7 @@ describe.each(['anthropic', 'google-genai'] as const)('%s malformed function-cal
     });
     try {
       const pending = service.request({ source: { type: 'turn', turnId: 1, step: 1 }, onAttemptRetry,
+        tools: [{ name: 'SaveWork', description: 'Save work', parameters: { type: 'object', properties: {} } }],
         retry: mode === 'never' ? 'never' : undefined }, part => { visible.push(part); }, AbortSignal.timeout(3500));
       if (mode === 'recover' || mode === 'tool') {
         expect((await pending).message).toMatchObject({ content: [{ type: 'text', text: 'recovered' }], toolCalls: [] });
@@ -3146,7 +3381,18 @@ describe.each(['anthropic', 'google-genai'] as const)('%s malformed function-cal
       }
       const expectedAttempts = mode === 'recover' || mode === 'tool' ? 2 : mode === 'exhaust' ? 3 : 1;
       expect(bodies).toHaveLength(expectedAttempts);
-      expect(new Set(bodies).size).toBe(1);
+      const parsed = bodies.map(body => JSON.parse(body) as Record<string, unknown>);
+      for (const [index, body] of parsed.entries()) {
+        if (protocol === 'anthropic') {
+          expect(body['tool_choice']).toEqual(index === 0 ? undefined : { type: 'auto' });
+          expect(body['thinking']).toMatchObject({ type: 'enabled', budget_tokens: 32000 });
+          delete body['tool_choice'];
+        } else {
+          expect(body['toolConfig']).toEqual(index === 0 ? undefined : { functionCallingConfig: { mode: 'AUTO' } });
+          delete body['toolConfig'];
+        }
+        expect(body).toEqual(parsed[0]);
+      }
       expect(onAttemptRetry.mock.calls).toEqual(Array.from({ length: expectedAttempts - 1 }, () => ['discard']));
       expect(events.filter(event => event.type === 'turn.step.retrying')).toHaveLength(expectedAttempts - 1);
     } finally {

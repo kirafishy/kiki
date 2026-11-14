@@ -30,7 +30,7 @@ export class TodoListTool implements ITodoListTool {
         const before = this.todo.getNotes(this.scope.agentId);
         if (args.todos === undefined && args.notes === undefined && !args.review_handoff) {
           const notes = renderTodoNotes(before.notes);
-          return { isError: false, output: `${renderTodoList(this.todo.getTodos(this.scope.agentId))}\nNotes revision: ${before.meta?.rev ?? 0}${notes ? `\n\n## Working notes\n${notes}` : ''}` };
+          return { isError: false, allowsTurnEndWithSendMessage: true, output: `${renderTodoList(this.todo.getTodos(this.scope.agentId))}\nNotes revision: ${before.meta?.rev ?? 0}${notes ? `\n\n## Working notes\n${notes}` : ''}` };
         }
         const changed: string[] = [];
         const cleared: string[] = [];
@@ -61,7 +61,7 @@ export class TodoListTool implements ITodoListTool {
         }
         const stored = this.todo.getNotes(this.scope.agentId);
         const todos = args.todos === undefined ? undefined : this.todo.getTodos(this.scope.agentId);
-        return { isError: false, output: JSON.stringify({
+        return { isError: false, allowsTurnEndWithSendMessage: true, output: JSON.stringify({
           changed, cleared, unchanged: changed.length === 0 && cleared.length === 0 && !args.review_handoff,
           notes_revision: stored.meta?.rev ?? 0,
           section_chars: sectionChars,

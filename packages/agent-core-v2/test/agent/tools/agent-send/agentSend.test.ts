@@ -1,15 +1,18 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
-import type { AgentMeta, ISessionMetadata } from '#/session/sessionMetadata/sessionMetadata';
+import { DisposableStore } from '#/_base/di/lifecycle';
+import { TestInstantiationService } from '#/_base/di/test';
+import { SyncDescriptor } from '#/_base/di/descriptors';
+import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
+import { ISessionMetadata, type AgentMeta } from '#/session/sessionMetadata/sessionMetadata';
 import {
   AGENT_MESSAGE_BACKLOG_LIMIT,
   AgentMessageMailboxFullError,
   type AgentMessageAcceptance,
-  type IAgentCollaborationMessagingService,
+  IAgentCollaborationMessagingService,
 } from '#/session/agentCollaboration/messageMailbox';
 import { COLLABORATION_TASK_NAME_LABEL } from '#/session/agentCollaboration/registry';
-import { AgentSendInputSchema } from '#/agent/tools/agent-send/agent-send';
+import { IAgentSendTool, AgentSendInputSchema } from '#/agent/tools/agent-send/agent-send';
 import { AgentSendTool } from '#/agent/tools/agent-send/agentSendTool';
 import { executeTool } from '../../../tools/fixtures/execute-tool';
 
@@ -23,6 +26,9 @@ const DIRECT_CHILD_ID = 'agt_child1';
 const TOOL_CALL_ID = 'toolu_send_1';
 
 const signal = new AbortController().signal;
+const disposables = new DisposableStore();
+
+afterEach(async () => { await disposables.clear(); });
 
 describe('AgentSend', () => {
   it('queues a message to an unnamed direct child addressed by agent id', async () => {
@@ -38,6 +44,7 @@ describe('AgentSend', () => {
     );
 
     expect(result.isError).toBeFalsy();
+    expect('allowsTurnEndWithSendMessage' in result && result.allowsTurnEndWithSendMessage).toBe(true);
     expect(JSON.parse(outputString(result))).toEqual({
       message_id: 'msg-1',
       status: 'queued',
@@ -74,6 +81,7 @@ describe('AgentSend', () => {
       context({ target: ANON_ID, message: 'wake and continue' }),
     );
 
+    expect('allowsTurnEndWithSendMessage' in result && result.allowsTurnEndWithSendMessage).toBe(true);
     expect(JSON.parse(outputString(result))).toEqual({
       message_id: 'msg-1',
       status: 'delivered',
@@ -97,6 +105,7 @@ describe('AgentSend', () => {
     );
 
     expect(result.isError).toBeFalsy();
+    expect('allowsTurnEndWithSendMessage' in result && result.allowsTurnEndWithSendMessage).toBe(true);
     expect(JSON.parse(outputString(result))).toEqual({
       message_id: 'msg-1',
       status: 'queued',
@@ -126,6 +135,7 @@ describe('AgentSend', () => {
     );
 
     expect(result.isError).toBeFalsy();
+    expect('allowsTurnEndWithSendMessage' in result && result.allowsTurnEndWithSendMessage).toBe(true);
     expect(JSON.parse(outputString(result))).toEqual({
       message_id: 'msg-1',
       status: 'queued',
@@ -285,22 +295,22 @@ function createTool(options: {
   readonly agents?: Record<string, AgentMeta>;
   readonly send?: IAgentCollaborationMessagingService['send'];
 }): {
-  readonly tool: AgentSendTool;
+  readonly tool: IAgentSendTool;
   readonly send: ReturnType<typeof vi.fn<IAgentCollaborationMessagingService['send']>>;
 } {
   const send =
     options.send === undefined
       ? vi.fn<IAgentCollaborationMessagingService['send']>(async (input) => queued(input))
       : vi.fn(options.send);
-  const tool = new AgentSendTool(
-    { agentId: options.callerAgentId ?? CALLER_ID } as IAgentScopeContext,
-    {
-      read: async () => ({ id: 'session-1', createdAt: 0, updatedAt: 0, archived: false, agents: options.agents ?? {} }),
-      getAgentExecutor: async (agentId: string) => options.agents?.[agentId]?.executor,
-    } as ISessionMetadata,
-    { send } as unknown as IAgentCollaborationMessagingService,
-  );
-  return { tool, send };
+  const ix = disposables.add(new TestInstantiationService());
+  ix.set(IAgentScopeContext, { agentId: options.callerAgentId ?? CALLER_ID } as unknown as IAgentScopeContext);
+  ix.set(ISessionMetadata, {
+    read: async () => ({ id: 'session-1', createdAt: 0, updatedAt: 0, archived: false, agents: options.agents ?? {} }),
+    getAgentExecutor: async (agentId: string) => options.agents?.[agentId]?.executor,
+  } as ISessionMetadata);
+  ix.set(IAgentCollaborationMessagingService, { send } as unknown as IAgentCollaborationMessagingService);
+  ix.set(IAgentSendTool, new SyncDescriptor(AgentSendTool));
+  return { tool: ix.get(IAgentSendTool), send };
 }
 
 function queued(

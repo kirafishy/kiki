@@ -28,7 +28,9 @@ import {
   decodeBase64Prefix,
   isDataUrl,
   isModelAcceptedImageMime,
+  INVALID_IMAGE_DATA_URL_MESSAGE,
   normalizeImageMime,
+  parseCompleteImageDataUrl,
   resolveEffectiveImageMime,
   unsupportedImageMimeFromUrl,
 } from './image-format-policy';
@@ -257,7 +259,9 @@ export class AgentMediaResolverService implements IAgentMediaResolverService {
       if (isDataUrl(part.imageUrl.url)) {
         throw new Error2(
           ErrorCodes.REQUEST_INVALID,
-          'The image attachment has an incomplete or invalid base64 data URL. Reattach the original image and retry.',
+          parseCompleteImageDataUrl(part.imageUrl.url) === null
+            ? INVALID_IMAGE_DATA_URL_MESSAGE
+            : 'The image attachment has valid base64 data, but its image content could not be decoded. The image may be damaged or unsupported by the local decoder. Reattach it as PNG or JPEG and retry.',
           { details: { mediaType: 'image', urlLength: part.imageUrl.url.length } },
         );
       }

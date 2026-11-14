@@ -9,7 +9,7 @@ const schema: Message = {
 const user: Message = { role: 'user', content: [{ type: 'text', text: 'hello' }], toolCalls: [] };
 
 describe('projectDynamicToolSchemas', () => {
-  it.each(['openai', 'openai_responses', 'anthropic'] as const)('%s renders each loaded schema as one stable system message', (protocol) => {
+  it.each(['openai', 'openai_responses', 'anthropic'] as const)('%s renders each loaded schema as one stable chronological message', (protocol) => {
     const history = [user, schema, user];
     const first = projectDynamicToolSchemas(history, protocol, false);
     const second = projectDynamicToolSchemas(history, protocol, false);
@@ -17,7 +17,7 @@ describe('projectDynamicToolSchemas', () => {
     expect(first[0]).toBe(user);
     expect(first[2]).toBe(user);
     expect(first[1]).toEqual({
-      role: 'system', toolCalls: [],
+      role: protocol === 'anthropic' ? 'user' : 'system', toolCalls: [],
       content: [{ type: 'text', text: '<dynamic_tool_schemas>[{"name":"mcp__srv__read","description":"Read a record.","parameters":{"type":"object"}}]</dynamic_tool_schemas>' }],
     });
     expect(schema.tools).toHaveLength(1);
@@ -36,7 +36,7 @@ describe('projectDynamicToolSchemas', () => {
       { type: 'text', text: '<dynamic_tool_schemas>[{"name":"browser__agent_browser_snapshot","description":"Snapshot.","parameters":{"type":"object"}}]</dynamic_tool_schemas>' },
     ]);
     expect(projectDynamicToolSchemas([browser], 'openai_responses', false)[0]?.content?.[0]).toMatchObject({ type: 'text' });
-    expect(projectDynamicToolSchemas([browser], 'anthropic', false)[0]?.role).toBe('system');
+    expect(projectDynamicToolSchemas([browser], 'anthropic', false)[0]?.role).toBe('user');
     expect(projectDynamicToolSchemas([browser], 'google-genai', false)).toEqual([browser]);
   });
 });

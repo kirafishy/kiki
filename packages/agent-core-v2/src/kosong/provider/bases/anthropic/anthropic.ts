@@ -1043,20 +1043,9 @@ export class AnthropicChatProvider implements ChatProvider {
           } as TextBlockParam,
         ]
       : [];
-    const ordinaryHistory: Message[] = [];
-    for (const message of history) {
-      if (message.role !== 'system' || message.content.length !== 1 ||
-        message.content[0]?.type !== 'text' ||
-        !message.content[0].text.startsWith('<dynamic_tool_schemas>')) {
-        ordinaryHistory.push(message);
-        continue;
-      }
-      system.push({ type: 'text', text: message.content[0].text });
-    }
-
     const messages = mergeConsecutiveUserMessages(
       normalizeToolCallIdsForProvider(
-        ordinaryHistory.filter((msg) => !isToolDeclarationOnlyMessage(msg)),
+        history.filter((msg) => !isToolDeclarationOnlyMessage(msg)),
         ANTHROPIC_TOOL_CALL_ID_POLICY,
       )
         .map((msg) => convertMessage(msg, this._model, this._acceptedImageMimes, this._isGemini))
@@ -1197,6 +1186,12 @@ export class AnthropicChatProvider implements ChatProvider {
 
     if (anthropicTools.length > 0) {
       createParams['tools'] = anthropicTools;
+      const choice = options?.toolChoice;
+      if (choice !== undefined) {
+        createParams['tool_choice'] = typeof choice === 'object'
+          ? { type: 'tool', name: choice.name }
+          : { type: choice === 'required' ? 'any' : choice };
+      }
     }
 
     if (metadata !== undefined) {

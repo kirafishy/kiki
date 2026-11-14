@@ -195,6 +195,7 @@ export class ModelRequesterImpl implements ModelRequester {
       signal,
       streamTaps: params.streamTaps,
       cacheKey: params?.cacheKey,
+      toolChoice: params.toolChoice,
       googleContinuationToken: params?.googleContinuationToken,
       serviceTier: isApiDefault(serviceTier) ? undefined : serviceTier,
       headers: params?.headers,

@@ -78,6 +78,8 @@ export interface ExecutableToolSuccessResult {
   readonly isError?: false | undefined;
   readonly stopTurn?: boolean | undefined;
   readonly userDeliveryConfirmed?: boolean | undefined;
+  /** Whether SendMessage may end the turn without synchronously consuming this result. */
+  readonly allowsTurnEndWithSendMessage?: boolean;
   readonly truncated?: boolean | undefined;
   readonly note?: string;
   readonly runtimeId?: string;

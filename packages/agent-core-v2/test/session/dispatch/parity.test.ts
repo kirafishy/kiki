@@ -1349,6 +1349,7 @@ describe('AgentRun and dispatch parity golden', () => {
     lane.ix.stub(IAgentPermissionGate, { authorize });
     const result = await lane.runInternal({ profile: 'coder', model_alias: pin, prompt: 'work', description: 'Select a model', background: true });
     expect(result.isError).not.toBe(true);
+    expect('allowsTurnEndWithSendMessage' in result && result.allowsTurnEndWithSendMessage).toBe(true);
     expect(fieldMap(outputText(result.output))['actual_model']).toBe(expected);
     expect(authorize).not.toHaveBeenCalled();
     await complete(lane, 0);
@@ -2886,6 +2887,7 @@ describe('AgentRun and dispatch parity golden', () => {
     });
 
     expect(result.isError).not.toBe(true);
+    expect('allowsTurnEndWithSendMessage' in result && result.allowsTurnEndWithSendMessage).toBe(true);
     expect(fieldMap(outputText(result.output))).toMatchObject({
       status: 'running',
       agent_id: 'agent_child_1',
@@ -2906,6 +2908,7 @@ describe('AgentRun and dispatch parity golden', () => {
     await complete(internal, 0, 'text result');
     const result = await pending;
 
+    expect('allowsTurnEndWithSendMessage' in result ? result.allowsTurnEndWithSendMessage : undefined).toBeUndefined();
     expect(outputText(result.output)).toBe([
       'task_id: task_1',
       'agent_id: agent_child_1',

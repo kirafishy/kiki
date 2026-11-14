@@ -1,4 +1,5 @@
 import { decodeWebp } from './webp-decode';
+import { pngWithoutAncillaryChunks } from './pngDecode';
 
 type JimpImage = Awaited<ReturnType<(typeof import('jimp'))['Jimp']['fromBuffer']>>;
 
@@ -12,7 +13,15 @@ export async function decodeToJimp(bytes: Uint8Array, normalizedMime: string): P
       height: decoded.height,
     });
   }
-  return Jimp.fromBuffer(Buffer.from(bytes));
+  const buffer = Buffer.from(bytes);
+  try {
+    return await Jimp.fromBuffer(buffer);
+  } catch (error) {
+    if (normalizedMime !== 'image/png') throw error;
+    const stripped = pngWithoutAncillaryChunks(buffer);
+    if (stripped === undefined) throw error;
+    return Jimp.fromBuffer(stripped);
+  }
 }
 
 export async function decodeImageVerdict(bytes: Uint8Array, mimeType: string): Promise<boolean> {

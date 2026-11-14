@@ -14,6 +14,10 @@ import {
 import { LifecycleScope } from '#/app/scopes';
 import { createScopedTestHost, createServices, stubPair } from '#/_base/di/test';
 import { buildKimiFileUrl } from '#/agent/media/kimiFileUrl';
+import { IAgentBlobService } from '#/agent/blob/agentBlobService';
+import { AgentBlobServiceImpl } from '#/agent/blob/agentBlobServiceImpl';
+import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
+import { closeCpuPool } from '#/app/cpuWorker/runtime';
 import { IAgentMediaResolverService } from '#/agent/media/mediaResolver';
 import { AgentMediaResolverService } from '#/agent/media/mediaResolverService';
 import { ISessionMediaStore } from '#/agent/media/sessionMediaStore';
@@ -34,6 +38,7 @@ import { IBlobStore } from '#/persistence/interface/blobStore';
 import { ErrorCodes } from '#/errors';
 
 import { registerStateServices } from '../../state/stubs';
+import { withPngChunk } from './pngFixtures';
 
 const PARALLEL_WORKER_CONTENTION_TIMEOUT_MS = 30_000;
 
@@ -583,6 +588,36 @@ describe('AgentMediaResolverService image strategy', () => {
       { type: 'image_url', imageUrl: { url: PNG_DATA_URL } },
     ]);
   });
+
+  it('revalidates a rehydrated blob image with recoverable ancillary metadata without losing its bytes', async () => {
+    const bytes = withPngChunk(withPngChunk(PNG_BYTES, 'tEXt', Buffer.alloc(4096, 65)), 'gAMA', Buffer.from([1]));
+    const blobs = blobStore();
+    const ix = createServices(disposables, { additionalServices: reg => {
+      reg.defineInstance(IBlobStore, blobs);
+      reg.definePartialInstance(IAgentScopeContext, { scope: name => `agents/main/${name}` });
+      reg.define(IAgentBlobService, AgentBlobServiceImpl);
+    } });
+    const blobService = ix.get(IAgentBlobService);
+    const original = imageMessage(`data:image/png;base64,${bytes.toString('base64')}`);
+    const persisted = await blobService.offloadParts(original.content);
+    expect(persisted[0]).toMatchObject({ type: 'image_url', imageUrl: { url: expect.stringMatching(/^blobref:image\/png;/u) } });
+    const rehydrated = [{ ...original, content: [...await blobService.loadParts(persisted)] }];
+    try {
+      expect(await resolver(new Map(), undefined, stubMediaStore(), blobs).resolve(rehydrated, requester({ providerType: 'anthropic' }))).toBe(rehydrated);
+      expect(rehydrated[0]?.content).toEqual(original.content);
+    } finally { await closeCpuPool(); }
+  }, PARALLEL_WORKER_CONTENTION_TIMEOUT_MS);
+
+  it('reports undecodable image content separately from invalid base64 syntax', async () => {
+    const res = resolver(new Map());
+    await expect(res.resolve([imageMessage('data:image/png;base64,%%%')], requester({})))
+      .rejects.toMatchObject({ code: ErrorCodes.REQUEST_INVALID, message: expect.stringContaining('incomplete or invalid base64 data URL') });
+    const url = `data:image/png;base64,${PNG_BYTES.subarray(0, -12).toString('base64')}`;
+    await expect(res.resolve([imageMessage(url)], requester({})))
+      .rejects.toMatchObject({ code: ErrorCodes.REQUEST_INVALID,
+        message: expect.stringContaining('valid base64 data, but its image content could not be decoded'),
+        details: { mediaType: 'image', urlLength: url.length } });
+  }, PARALLEL_WORKER_CONTENTION_TIMEOUT_MS);
 
   it('keeps every attachment when accumulated inline media exceeds 20 MiB', async () => {
     const bytes = Buffer.concat([PNG_BYTES, Buffer.alloc(11 * 1024 * 1024)]);

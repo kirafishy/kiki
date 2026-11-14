@@ -7,6 +7,7 @@ import type {
   SamplingOptions,
   ServiceTier,
   ThinkingEffort,
+  ToolChoice,
   RequestIdentityWireOptions,
   RawResponseObserver,
   ImageUploadInput,
@@ -55,6 +56,7 @@ export interface ModelRequestParams {
   readonly preBaselinePatch?: PreBaselineRequestPatch;
   readonly streamTaps?: readonly LLMStreamTapObserver[];
   readonly cacheKey?: string;
+  readonly toolChoice?: ToolChoice;
   readonly googleContinuationToken?: string;
   readonly serviceTier?: OptionalParameter<ServiceTier>;
   readonly headers?: Readonly<Record<string, string>>;
@@ -80,7 +82,7 @@ export interface ModelRequestParams {
 
 /** The `ModelRequester` contract: per-turn input, the streamed `ModelRequestEvent` output, and the
  *  deliberately dialect-free per-turn intent carrier `ModelRequestParams` (prompt-cache key, service
- *  tier, transport headers, additional request params, sampling overrides, thinking effort/keep, and
+ *  tier, tool choice, transport headers, additional request params, sampling overrides, thinking effort/keep, and
  *  the completion-token budget with its window-clamp companions). The requester maps the params onto
  *  `GenerateOptions`, with the configured model service tier supplying a fallback for the request
  *  tier; typed fields are resolved before `requestParams`, whose entries only fill keys the dialect

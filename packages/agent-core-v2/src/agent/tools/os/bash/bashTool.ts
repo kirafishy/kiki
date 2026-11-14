@@ -439,6 +439,7 @@ export class BashTool implements IBashTool {
       readonly brief: string;
     } = {
       isError: false,
+      allowsTurnEndWithSendMessage: scenario === 'background_started' ? true : undefined,
       output:
         foregroundOutput.length === 0
           ? metadata

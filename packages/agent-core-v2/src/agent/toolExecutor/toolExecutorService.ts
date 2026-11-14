@@ -1174,7 +1174,7 @@ function normalizeToolResult(result: ExecutableToolResult): ToolResult {
       isError: true,
     };
   }
-  return base;
+  return { ...base, allowsTurnEndWithSendMessage: result.allowsTurnEndWithSendMessage };
 }
 
 function toolTelemetryOutcome(result: ToolResult): 'success' | 'error' | 'cancelled' {

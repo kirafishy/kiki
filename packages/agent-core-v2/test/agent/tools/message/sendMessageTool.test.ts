@@ -8,7 +8,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Event } from '#/_base/event';
 import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import { MESSAGE_DELIVERY_NEXT_TURN_GUIDANCE, MESSAGE_DELIVERY_SENT_GUIDANCE } from '#/agent/delivery/deliveryReminder';
-import { IAgentLoopService } from '#/agent/loop/loop';
+import { IAgentLoopService, type Turn } from '#/agent/loop/loop';
+import { ISessionExecutionControl, type ExecutionResumePoint } from '#/session/executionControl/executionControl';
+import { IAgentLLMRequesterService } from '#/agent/llmRequester/llmRequester';
+import { readGenerateFailureFacts } from '#/kosong/contract/generate';
 import { IAgentGoalService } from '#/agent/goal/goal';
 import { IAgentToolExecutorService } from '#/agent/toolExecutor/toolExecutor';
 import { TaskNotificationStepRequest } from '#/agent/task/taskService';
@@ -44,7 +47,7 @@ import type { ExecutableToolResult } from '#/tool/toolContract';
 import { IAgentPermissionModeService } from '#/agent/permissionMode/permissionMode';
 import { IAgentPermissionRulesService } from '#/agent/permissionRules/permissionRules';
 import { IAgentPermissionPolicyService } from '#/agent/permissionPolicy/permissionPolicy';
-import { appServices, createTestAgent, externalHookServices, homeDirServices, permissionModeServices, type TestAgentContext, type TestAgentServiceOverride } from '../../../harness';
+import { appServices, createTestAgent, externalHookServices, homeDirServices, permissionModeServices, type TestAgentContext, type TestAgentOptions, type TestAgentServiceOverride } from '../../../harness';
 import { makeHookRunner, nodeCommand } from '../../../features/externalHooks/runner-stub';
 
 let ctx: TestAgentContext;
@@ -54,7 +57,7 @@ afterEach(async () => {
   for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });
 });
 
-async function messageAgent(...overrides: TestAgentServiceOverride[]): Promise<TestAgentContext> {
+async function messageAgent(...overrides: Array<TestAgentServiceOverride | TestAgentOptions>): Promise<TestAgentContext> {
   ctx = createTestAgent(...overrides);
   const delivery = ctx.get(ISessionDeliveryService);
   await delivery.ready;
@@ -76,6 +79,15 @@ async function mediaAgent(files: readonly string[], ...overrides: TestAgentServi
 async function execute(input: Parameters<ISendMessageTool['resolveExecution']>[0], context = { turnId: 0, toolCallId: 'send-1', signal: new AbortController().signal }): Promise<ExecutableToolResult> {
   const execution = await ctx.get(ISendMessageTool).resolveExecution(input);
   return 'execute' in execution ? execution.execute(context) : execution;
+}
+
+function declareNormalCompletions(): void {
+  const requester = ctx.get(IAgentLLMRequesterService);
+  const start = requester.start.bind(requester);
+  vi.spyOn(requester, 'start').mockImplementation((...args) => {
+    const task = start(...args);
+    return { ...task, result: task.result.then(response => ({ ...response, completionAuthority: 'normal' as const })) };
+  });
 }
 
 function historyText(index: number): string {
@@ -463,7 +475,8 @@ describe('SendMessage completion guidance', () => {
     const tool = ctx.get(ISendMessageTool);
     expect(tool.description).not.toContain('Ordinary assistant text is not delivered');
     expect(tool.description).toContain('A final ordinary reply is delivered in full as a fallback');
-    expect(tool.description).toContain('if the request is complete and no work remains');
+    expect(tool.description).toContain('this turn has no remaining synchronous work');
+    expect(tool.description).toContain('background AgentRun, Bash, or AskUserQuestion');
     expect(tool.description).toContain('Do not split one message into sentences');
     expect(tool.description).toContain('set end_turn=true');
     expect(tool.parameters).toMatchObject({ properties: { end_turn: { type: 'boolean' } } });
@@ -777,6 +790,61 @@ describe('SendMessage completion guidance', () => {
     expect(ctx.llmCalls).toHaveLength(3);
   });
 
+  it('ends after delivered SendMessage with detached and bookkeeping results in either execution order', async () => {
+    await messageAgent();
+    const companions = ['AgentRun', 'Bash', 'AgentSend', 'AskUserQuestion', 'DetachedWork'];
+    const runs = new Set<string>();
+    const registrations = companions.map(name => ctx.get(IAgentToolRegistryService).register({
+      name, description: 'Dispatch fixture work.', parameters: { type: 'object' },
+      resolveExecution: () => ({ approvalRule: name, execute: async () => {
+        runs.add(name);
+        return { output: 'Detached receipt.', allowsTurnEndWithSendMessage: true };
+      } }),
+    }));
+    try {
+      for (const sendFirst of [true, false]) {
+        runs.clear();
+        const send = { type: 'function' as const, id: `send-${sendFirst}`, name: 'SendMessage', arguments: '{"text":"Waiting for notifications.","end_turn":true}' };
+        const calls = companions.map(name => ({ type: 'function' as const, id: `${name}-${sendFirst}`, name, arguments: '{}' }));
+        calls.push({ type: 'function', id: `todo-${sendFirst}`, name: 'TodoList', arguments: '{}' });
+        ctx.mockNextResponse(...(sendFirst ? [send, ...calls] : [...calls, send]));
+        const result = await ctx.get(IAgentPromptService).submitAndWait({ input: [{ type: 'text', text: 'Dispatch and reply.' }] });
+        expect(result.state).toBe('completed');
+        expect(runs).toEqual(new Set(companions));
+        expect(ctx.llmCalls).toHaveLength(sendFirst ? 1 : 2);
+      }
+      await ctx.expectResumeMatches();
+    } finally {
+      for (const registration of registrations) await registration.dispose();
+    }
+  });
+
+  it.each([
+    { name: 'Bash', args: { command: 'fixture' }, result: { output: 'Foreground stdout.' } },
+    { name: 'AgentRun', args: { background: false }, result: { output: 'Child final report.' } },
+    { name: 'DetachedWork', args: {}, result: { output: 'Task registration failed.', isError: true as const } },
+  ])('reviews the synchronous or failed $name result before ending', async ({ name, args, result }) => {
+    await messageAgent();
+    const registration = ctx.get(IAgentToolRegistryService).register({
+      name, description: 'Return a fixture result.', parameters: { type: 'object' },
+      resolveExecution: () => ({ approvalRule: name, execute: async () => result }),
+    });
+    try {
+      ctx.mockNextResponse(
+        { type: 'function', id: 'send-before-review', name: 'SendMessage', arguments: '{"text":"Current answer.","end_turn":true}' },
+        { type: 'function', id: 'review-result', name, arguments: JSON.stringify(args) },
+      );
+      ctx.mockNextResponse({ type: 'text', text: 'Result reviewed.' });
+      const outcome = await ctx.get(IAgentPromptService).submitAndWait({ input: [{ type: 'text', text: 'Reply and review.' }] });
+      expect(outcome.state).toBe('completed');
+      expect(ctx.llmCalls).toHaveLength(2);
+      expect(historyText(1)).toContain(result.output);
+      await ctx.expectResumeMatches();
+    } finally {
+      await registration.dispose();
+    }
+  });
+
   it('converges an antigravity_empty_response post-delivery continuation to completed when SendMessage omitted end_turn', async () => {
     await messageAgent();
     ctx.mockNextResponse({ type: 'function', id: 'send-without-flag', name: 'SendMessage', arguments: '{"text":"Delivered without end_turn."}' });
@@ -787,6 +855,144 @@ describe('SendMessage completion guidance', () => {
     const outcome = await ctx.get(IAgentPromptService).submitAndWait({ input: [{ type: 'text', text: 'Say hello.' }] });
     expect(outcome.state).toBe('completed');
     expect(ctx.llmCalls).toHaveLength(2);
+    await ctx.expectResumeMatches();
+  });
+
+  it.each([false, true])('silently ends a classified thinking-only stop after delivery with a prior continuation budget of %s', async (usedBudget) => {
+    await messageAgent();
+    declareNormalCompletions();
+    if (usedBudget) ctx.mockNextResponse({ type: 'think', think: 'Earlier thinking-only stop.', encrypted: 'sig-earlier' });
+    ctx.mockNextProviderResponse({
+      parts: [{ type: 'function', id: 'send-without-flag', name: 'SendMessage', arguments: '{"text":"Already delivered."}' }],
+      finishReason: usedBudget ? 'other' : 'tool_calls',
+    });
+    ctx.mockNextProviderResponse({
+      parts: [{ type: 'think', think: 'The reply is delivered; wait for notifications.', encrypted: 'sig-post-delivery' }],
+      error: markProviderEventError(new ChatProviderError('Clean thinking-only stop.'), 'antigravity_thinking_only'),
+    });
+    const outcome = await ctx.get(IAgentPromptService).submitAndWait({ input: [{ type: 'text', text: 'Reply once.' }] });
+    expect(outcome.state).toBe('completed');
+    expect(ctx.llmCalls).toHaveLength(usedBudget ? 3 : 2);
+    expect(ctx.contextData().history.flatMap(message => message.content)).toContainEqual({
+      type: 'think', think: 'The reply is delivered; wait for notifications.', encrypted: 'sig-post-delivery',
+    });
+    expect(ctx.get(IAgentLoopService).status()).toMatchObject({ state: 'idle', hasPendingRequests: false });
+    await ctx.expectResumeMatches();
+  });
+
+  it.each([
+    { prefill: true, thinking: true }, { prefill: false, thinking: true },
+    { prefill: true, thinking: false }, { prefill: false, thinking: false },
+  ])('silently ends a normal completed response after delivery (prefill=$prefill, thinking=$thinking)', async ({ prefill, thinking }) => {
+    await messageAgent({ initialConfig: { loopControl: { zeroOutputContinuation: true } } });
+    declareNormalCompletions();
+    vi.spyOn(ctx.get(IAgentLLMRequesterService), 'supportsAssistantPrefill').mockReturnValue(prefill);
+    ctx.mockNextResponse({ type: 'function', id: 'send-without-flag', name: 'SendMessage', arguments: '{"text":"Already delivered."}' });
+    ctx.mockNextProviderResponse({ parts: thinking ? [{ type: 'think', think: 'Wait quietly.', encrypted: 'sig-quiet' }] : [], finishReason: 'completed' });
+    const outcome = await ctx.get(IAgentPromptService).submitAndWait({ input: [{ type: 'text', text: 'Reply once.' }] });
+    expect(outcome.state).toBe('completed');
+    expect(ctx.llmCalls).toHaveLength(2);
+    if (thinking) expect(ctx.contextData().history.flatMap(message => message.content)).toContainEqual({ type: 'think', think: 'Wait quietly.', encrypted: 'sig-quiet' });
+    expect(ctx.get(IAgentLoopService).status()).toMatchObject({ state: 'idle', hasPendingRequests: false });
+    await ctx.expectResumeMatches();
+  });
+
+  it.each(['normal', 'classified'] as const)('continues a child receipt after confirmed delivery instead of accepting a %s thinking-only stop', async (kind) => {
+    await messageAgent(appServices(reg => reg.definePartialInstance(IUserMessageRouter, {
+      sendMessage: async () => {
+        Reflect.set(ctx.get(IAgentScopeContext), 'parentAgentId', 'example-parent');
+        return { messageId: 'delivered', deliveredTo: ['user'], delivery: 'delivered' as const };
+      },
+    })));
+    declareNormalCompletions();
+    ctx.mockNextResponse({ type: 'function', id: 'send-before-child-receipt', name: 'SendMessage', arguments: '{"text":"Delivered."}' });
+    ctx.mockNextProviderResponse({
+      parts: [{ type: 'think', think: 'A child still owes a receipt.', encrypted: 'sig-child' }],
+      error: kind === 'classified' ? markProviderEventError(new ChatProviderError('Clean thinking-only stop.'), 'antigravity_thinking_only') : undefined,
+    });
+    ctx.mockNextResponse({ type: 'text', text: 'Child final receipt.' });
+    const outcome = await ctx.get(IAgentPromptService).submitAndWait({ input: [{ type: 'text', text: 'Reply and return a receipt.' }] });
+    expect(outcome.state).toBe('completed');
+    expect(ctx.llmCalls).toHaveLength(3);
+    expect(historyText(2)).toContain('Continue.');
+    await ctx.expectResumeMatches();
+  });
+
+  it.each(['normal', 'classified'] as const)('retains confirmed delivery across a parked turn before a %s silent completion', async (kind) => {
+    await messageAgent();
+    declareNormalCompletions();
+    const loop = ctx.get(IAgentLoopService);
+    const control = ctx.get(ISessionExecutionControl);
+    let reached!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>(resolve => { reached = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const hook = loop.hooks.onDidFinishStep.register('pause-after-delivery', async (step, next) => {
+      await next();
+      if (step.step !== 1) return;
+      reached();
+      await held;
+    });
+    ctx.mockNextResponse({ type: 'function', id: 'send-before-park', name: 'SendMessage', arguments: '{"text":"Already delivered."}' });
+    ctx.mockNextProviderResponse({
+      parts: [{ type: 'think', think: 'Wait for notifications.', encrypted: 'sig-resumed' }],
+      error: kind === 'classified' ? markProviderEventError(new ChatProviderError('Clean thinking-only stop.'), 'antigravity_thinking_only') : undefined,
+    });
+    try {
+      await ctx.get(IAgentPromptService).enqueue({ message: { role: 'user', content: [{ type: 'text', text: 'Reply once.' }], toolCalls: [] } });
+      await entered;
+      await control.pause({ operationId: 'pause-after-delivery' });
+      release();
+      await vi.waitFor(async () => expect(await control.read()).toMatchObject({ phase: 'paused' }));
+      const point = JSON.parse(JSON.stringify(control.resumePoint('main'))) as ExecutionResumePoint;
+      expect(point).toMatchObject({ completedSteps: 1, userDeliveryConfirmed: true });
+      expect(point.pendingStep).toBeUndefined();
+      expect(loop.preservePausedForExit?.()).toBe(true);
+      await loop.settled();
+      const internal = loop as unknown as {
+        parkedForExit: boolean;
+        resumeExecution(point: ExecutionResumePoint): Promise<Turn | undefined>;
+        pumpTurns(): void;
+      };
+      internal.parkedForExit = false;
+      const resumed = await internal.resumeExecution(point);
+      expect(resumed).toBeDefined();
+      await control.cancelPause({ operationId: 'release-delivered-turn', pauseOperationId: 'pause-after-delivery' });
+      internal.pumpTurns();
+      expect(await resumed!.result).toMatchObject({ type: 'completed', steps: 2 });
+      expect(ctx.llmCalls).toHaveLength(2);
+      expect(ctx.contextData().history.flatMap(message => message.content)).toContainEqual({ type: 'think', think: 'Wait for notifications.', encrypted: 'sig-resumed' });
+      await ctx.expectResumeMatches();
+    } finally {
+      release();
+      await hook.dispose();
+    }
+  });
+
+  it('keeps a partial classified thinking failure after confirmed delivery as a failure', async () => {
+    await messageAgent();
+    let partialFailureObserved = false;
+    const requester = ctx.get(IAgentLLMRequesterService);
+    const start = requester.start.bind(requester);
+    vi.spyOn(requester, 'start').mockImplementation((...args) => {
+      const task = start(...args);
+      return { ...task, result: task.result.catch(error => {
+        const facts = readGenerateFailureFacts(error);
+        expect(facts).toBeDefined();
+        Reflect.set(facts!.message, 'partial', true);
+        partialFailureObserved = true;
+        throw error;
+      }) };
+    });
+    ctx.mockNextResponse({ type: 'function', id: 'send-before-partial', name: 'SendMessage', arguments: '{"text":"Delivered."}' });
+    ctx.mockNextProviderResponse({
+      parts: [{ type: 'think', think: 'Interrupted thinking.', encrypted: 'sig-partial' }],
+      error: markProviderEventError(new ChatProviderError('Partial thinking-only failure.'), 'antigravity_thinking_only'),
+    });
+    const outcome = await ctx.get(IAgentPromptService).submitAndWait({ input: [{ type: 'text', text: 'Reply once.' }] });
+    expect(outcome.state).toBe('failed');
+    expect(ctx.llmCalls).toHaveLength(2);
+    expect(partialFailureObserved).toBe(true);
     await ctx.expectResumeMatches();
   });
 
@@ -838,7 +1044,7 @@ describe('SendMessage completion guidance', () => {
       expect((await ctx.get(IAgentPromptService).submitAndWait({ input: [{ type: 'text', text: 'Check and finish the work.' }] })).state).toBe('completed');
       expect(work).toHaveBeenCalledTimes(2);
       expect(ctx.llmCalls).toHaveLength(3);
-      expect(historyText(1)).toContain('If this was a progress update and work remains, continue');
+      expect(historyText(1)).toContain('this turn still needs synchronous follow-up tools or result review');
       expect(sendCalls()).toEqual(['send-progress']);
     } finally {
       await registration.dispose();

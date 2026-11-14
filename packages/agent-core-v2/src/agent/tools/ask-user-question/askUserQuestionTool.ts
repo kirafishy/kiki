@@ -183,6 +183,7 @@ export class AskUserQuestionTool implements IAskUserQuestionTool {
     const status = this.tasks.getTask(taskId)?.status ?? 'running';
     return {
       isError: false,
+      allowsTurnEndWithSendMessage: true,
       output:
         `task_id: ${taskId}\n` +
         `description: ${description}\n` +

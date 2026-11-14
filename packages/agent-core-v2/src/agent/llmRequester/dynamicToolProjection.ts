@@ -14,7 +14,7 @@ export function projectDynamicToolSchemas(
     const { tools, ...rest } = message;
     return {
       ...rest,
-      role: 'system' as const,
+      role: protocol === 'anthropic' ? 'user' as const : 'system' as const,
       content: [
         ...message.content,
         {

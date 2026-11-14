@@ -26,6 +26,7 @@ export interface ExecutionPendingStep {
 
 export interface ExecutionResumePoint {
   readonly pendingStep?: ExecutionPendingStep;
+  readonly userDeliveryConfirmed?: boolean;
   readonly turnId: number;
   readonly completedSteps: number;
   readonly seed: TurnSeed;
