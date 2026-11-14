@@ -172,20 +172,39 @@ function PluginSettingsDocument({ pluginId, panelId, label }: PluginSettingsPane
     retry: false,
   });
   const panelDocument = documentQuery.data;
+  const freshMintedAt = documentQuery.dataUpdatedAt || Date.now();
   const [renderedState, setRenderedState] = useState<{
     readonly identity: string;
     readonly doc: NonNullable<typeof panelDocument>;
-  } | undefined>(() => (panelDocument === undefined ? undefined : { identity: documentIdentity, doc: panelDocument }));
-  if (
-    !dirty &&
-    panelDocument !== undefined &&
-    (renderedState === undefined ||
-      renderedState.identity !== documentIdentity ||
+    readonly needsFreshGrant: boolean;
+  } | undefined>(() =>
+    panelDocument === undefined
+      ? undefined
+      : {
+          identity: documentIdentity,
+          doc: panelDocument,
+          needsFreshGrant: panelDocument.url !== undefined && Date.now() - freshMintedAt >= 8 * 60_000,
+        },
+  );
+  if (!dirty && panelDocument !== undefined) {
+    const identityChanged = renderedState !== undefined && renderedState.identity !== documentIdentity;
+    if (
+      renderedState === undefined ||
+      identityChanged ||
       renderedState.doc.html !== panelDocument.html ||
-      (renderedState.doc.url === undefined) !== (panelDocument.url === undefined))
-  ) {
-    setRenderedState({ identity: documentIdentity, doc: panelDocument });
-    setFrameHeight(undefined);
+      (renderedState.doc.url === undefined) !== (panelDocument.url === undefined) ||
+      (renderedState.needsFreshGrant && panelDocument !== renderedState.doc)
+    ) {
+      const staleFromPreviousIdentity = identityChanged && panelDocument === renderedState.doc;
+      setRenderedState({
+        identity: documentIdentity,
+        doc: panelDocument,
+        needsFreshGrant:
+          staleFromPreviousIdentity ||
+          (panelDocument.url !== undefined && Date.now() - freshMintedAt >= 8 * 60_000),
+      });
+      setFrameHeight(undefined);
+    }
   }
   const renderedDocument = renderedState?.doc;
 

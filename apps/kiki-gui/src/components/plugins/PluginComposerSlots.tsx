@@ -119,6 +119,13 @@ export async function fetchPluginGuiSlots(
     signal,
   });
   if (response.status === 404) return EMPTY_GUI_SLOTS;
+  if (!response.ok) {
+    throw new ApiError({
+      code: API_CODES.INVALID_RESPONSE,
+      msg: `HTTP ${response.status} — plugin GUI slots request failed`,
+      data: null,
+    });
+  }
   let envelope: unknown = null;
   try {
     envelope = await response.json();

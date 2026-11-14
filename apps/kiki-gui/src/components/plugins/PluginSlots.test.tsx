@@ -285,5 +285,13 @@ describe('E12 declarative plugin GUI slot components', () => {
 
     fetchSpy.mockResolvedValueOnce(new Response('bad gateway', { status: 502 }));
     await expect(fetchPluginGuiSlots(fakeConnection, { sessionId: 'sess-1' })).rejects.toThrow(/HTTP 502/);
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ code: 0, data: { slots: [] } }), {
+        status: 503,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    await expect(fetchPluginGuiSlots(fakeConnection, { sessionId: 'sess-1' })).rejects.toThrow(/HTTP 503/);
   });
 });

@@ -36,9 +36,9 @@ const PANEL_GRANT_SAFE_REUSE_MS = 8 * 60_000;
 
 interface PinnedPanelDocument {
   readonly identity: string;
+  readonly sourceDoc: { readonly html: string; readonly url?: string };
   readonly html: string;
   readonly url?: string;
-  readonly mintedAt: number;
   readonly needsFreshGrant: boolean;
 }
 
@@ -97,8 +97,17 @@ export function PluginPanelHost({
     connection !== null && connection !== undefined && 'scopeId' in connection && typeof connection.scopeId === 'string'
       ? connection.scopeId
       : '';
+  const serverId =
+    connection !== null &&
+    connection !== undefined &&
+    'meta' in connection &&
+    connection.meta !== null &&
+    connection.meta !== undefined &&
+    typeof (connection.meta as { server_id?: unknown }).server_id === 'string'
+      ? (connection.meta as { server_id: string }).server_id
+      : '';
   const baseOrigin = client.baseUrl || (typeof window !== 'undefined' ? window.location.origin : '');
-  const documentIdentity = `${scopeId}\0${baseOrigin}\0${pluginId}\0${panelId}\0${targetKey}`;
+  const documentIdentity = `${scopeId}\0${serverId}\0${baseOrigin}\0${pluginId}\0${panelId}\0${targetKey}`;
   const resolvedClassName =
     className ??
     (variant === 'workspace'
@@ -175,23 +184,23 @@ export function PluginPanelHost({
   if (panelDocument !== undefined) {
     const freshMintedAt = documentQuery.dataUpdatedAt || Date.now();
     const currentPinned = pinnedRef.current;
+    const identityChanged = currentPinned !== null && currentPinned.identity !== documentIdentity;
     if (
       currentPinned === null ||
-      currentPinned.identity !== documentIdentity ||
+      identityChanged ||
       currentPinned.html !== panelDocument.html ||
       (currentPinned.url === undefined) !== (panelDocument.url === undefined) ||
-      (currentPinned.needsFreshGrant &&
-        panelDocument.url !== undefined &&
-        currentPinned.url !== panelDocument.url &&
-        freshMintedAt > currentPinned.mintedAt)
+      (currentPinned.needsFreshGrant && panelDocument !== currentPinned.sourceDoc)
     ) {
+      const staleFromPreviousIdentity = identityChanged && panelDocument === currentPinned.sourceDoc;
       pinnedRef.current = {
         identity: documentIdentity,
+        sourceDoc: panelDocument,
         html: panelDocument.html,
         url: panelDocument.url,
-        mintedAt: freshMintedAt,
         needsFreshGrant:
-          panelDocument.url !== undefined && Date.now() - freshMintedAt >= PANEL_GRANT_SAFE_REUSE_MS,
+          staleFromPreviousIdentity ||
+          (panelDocument.url !== undefined && Date.now() - freshMintedAt >= PANEL_GRANT_SAFE_REUSE_MS),
       };
     }
   }
