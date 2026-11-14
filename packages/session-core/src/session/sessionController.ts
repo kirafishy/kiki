@@ -503,6 +503,8 @@ export class SessionController {
   private frameHandle: unknown = null;
   private hiddenFrameTimer: ReturnType<typeof setTimeout> | null = null;
   private resyncInFlight = false;
+  private resyncInFlightRewrite = false;
+  private resyncDeferredBySuspend: { rewrite: boolean } | undefined;
   private resyncGeneration = 0;
   private readonly resyncIdleWaiters = new Set<() => void>();
   private rosterRefreshInFlight = false;
@@ -1044,6 +1046,10 @@ export class SessionController {
    */
   suspend(): void {
     if (this.closed || this.isSuspended) return;
+    const rewrite = this.resyncDeferredBySuspend?.rewrite === true || this.resyncInFlightRewrite || this.rewriteHold !== undefined || this.rewriteResyncQueued;
+    if (this.resyncDeferredBySuspend !== undefined || this.resyncInFlight || this.shell.resyncing || this.resyncTimer !== null || this.hardResyncQueued || this.rewriteResyncQueued || this.rewriteHold !== undefined) {
+      this.resyncDeferredBySuspend = { rewrite };
+    }
     this.isSuspended = true;
     this.finishBootstrapOpening();
     this.pauseDurableSteerReads();
@@ -1053,6 +1059,9 @@ export class SessionController {
     this.clearResyncTimer();
     this.clearRosterLeaseTimer();
     this.clearRewriteHold();
+    this.hardResyncQueued = false;
+    this.rewriteResyncQueued = false;
+    this.setShell(setResyncing(this.shell, false));
     this.cancelVisibleFrameFlush();
     this.clearHiddenFrameTimer();
     // Batches that have not been applied yet are dropped together with their
@@ -1082,9 +1091,22 @@ export class SessionController {
     if (this.closed || !this.isSuspended) return Promise.resolve();
     this.isSuspended = false;
     this.scheduleDurableSteerRead();
+    const deferredResync = this.resyncDeferredBySuspend;
+    if (deferredResync !== undefined) {
+      this.transcriptGrades = this.requestedTranscriptGrades();
+      if (this.resyncInFlight) {
+        return this.waitForResyncIdle().then((status) => {
+          if (status === 'cancelled' || this.closed || this.isSuspended) return;
+          this.resyncDeferredBySuspend = undefined;
+          return this.resync({ rewrite: deferredResync.rewrite });
+        });
+      }
+      this.resyncDeferredBySuspend = undefined;
+      return this.resync({ rewrite: deferredResync.rewrite });
+    }
     if (!this.shell.loaded) return this.open();
-    if (this.shell.resyncFailed) return this.resync();
     this.transcriptGrades = this.requestedTranscriptGrades();
+    if (this.shell.resyncFailed) return this.resync();
     this.attachView(this.shell.cursor);
     void this.pumpContentReads();
     return this.refreshShell();
@@ -1099,7 +1121,7 @@ export class SessionController {
         void this.resync();
         return;
       }
-      this.setSessionView(this.applyTranscriptShellSnapshot(snapshot), false);
+      this.setSessionView(setResyncing(this.applyTranscriptShellSnapshot(snapshot), this.resyncInFlight), false);
       this.publishForest();
       this.publish(MAIN_AGENT_ID);
     } catch (error) {
@@ -1771,6 +1793,7 @@ export class SessionController {
       return;
     }
     this.resyncInFlight = true;
+    this.resyncInFlightRewrite = rewrite;
     this.resyncGeneration += 1;
     for (const { agentId } of this.storeTimelines) this.bumpHistoryGeneration(agentId);
     if (rewrite) this.rewriteResyncQueued = false;
@@ -1824,7 +1847,8 @@ export class SessionController {
       if (rewriteHoldToken !== undefined) this.armRewriteSubscription(rewriteHoldToken);
     } catch (error) {
       if (rewriteHoldToken !== undefined) this.clearRewriteHold(rewriteHoldToken);
-      if (!this.closed && !this.isSuspended && (attachment === this.viewAttachment || this.shell.resyncError?.retryable !== false)) {
+      if (!this.closed && !this.isSuspended && !(attachment !== this.viewAttachment && isAbortError(error)) &&
+          (attachment === this.viewAttachment || this.shell.resyncError?.retryable !== false)) {
         const attempt = this.shell.resyncAttempt + 1;
         const code = error instanceof ApiError || error instanceof RPCError ? error.code : undefined;
         const retryable = code === undefined || code === -1 || code === API_CODES.TIMEOUT ||
@@ -1848,8 +1872,9 @@ export class SessionController {
       }
     } finally {
       this.resyncInFlight = false;
+      this.resyncInFlightRewrite = false;
       let rerunQueued = false;
-      if (!this.closed) {
+      if (!this.closed && !this.isSuspended) {
         if (this.hardResyncQueued) {
           rerunQueued = true;
           this.hardResyncQueued = false;
@@ -1860,8 +1885,17 @@ export class SessionController {
           this.rewriteResyncQueued = false;
           queueMicrotask(() => void this.resync({ rewrite: true }));
         }
+      } else if (this.isSuspended) {
+        this.resyncDeferredBySuspend = {
+          rewrite: this.resyncDeferredBySuspend?.rewrite === true || rewrite || this.rewriteResyncQueued,
+        };
+        this.hardResyncQueued = false;
+        this.rewriteResyncQueued = false;
       }
-      if (!rerunQueued) this.resolveResyncIdleWaiters();
+      if (!rerunQueued) {
+        if (!this.closed) this.setShell(setResyncing(this.shell, false));
+        this.resolveResyncIdleWaiters();
+      }
     }
   }
 

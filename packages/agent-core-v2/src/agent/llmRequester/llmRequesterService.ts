@@ -1282,7 +1282,7 @@ export class AgentLLMRequesterService extends Disposable implements IAgentLLMReq
       requestIdentity: identityProjection.wire,
     };
     const sections = await this.extensions?.current?.renderPromptSections({
-      sessionId: this.sessionContext.sessionId, agentId: this.agentContext.agentId,
+      sessionId: this.sessionContext.sessionId, agentId: this.agentContext.agentId, workspaceId: this.sessionContext.workspaceId,
       profileName: this.profile.data().profileName, modelAlias: resolved.modelAlias, workspaceRoot: this.sessionContext.cwd,
     });
     const systemPrompt = anchoredPrompt ?? (overrides.systemPrompt !== undefined

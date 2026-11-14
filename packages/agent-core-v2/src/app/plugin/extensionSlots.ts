@@ -106,6 +106,7 @@ export interface PromptSectionContribution {
   render(context: {
     readonly sessionId: string;
     readonly agentId: string;
+    readonly workspaceId?: string;
     readonly profileName?: string;
     readonly modelAlias?: string;
     readonly workspaceRoot?: string;

@@ -18,6 +18,7 @@ import {
 import { describe, expect, it, vi } from 'vitest';
 import { ISessionMetadata, type AgentMeta } from '#/session/sessionMetadata/sessionMetadata';
 import { coldPromptFixture } from './coldPromptFixture';
+import { filterPromotedDescendantRecords } from '#/workspace/sessionLifecycle/internal/promoteAgent';
 import { resolveExecutionBinding } from '#/agent/profile/executionBinding';
 import { attachExternalMailboxHarness } from './mailboxHarness';
 
@@ -1318,6 +1319,28 @@ describe('Codex app-server external executor', () => {
       expect(harness.starts).toHaveLength(0);
       expect(harness.prompts).toHaveLength(0);
     } finally { await harness.session.shutdown(); }
+  });
+
+  it.each([false, true])('seeds a promoted Codex descendant into its own remote thread with execution binding %s', async (explicitBinding) => {
+    const harness = createHarness({ priorThreadId: 'source-thread', history: [
+      { role: 'user', content: [{ type: 'text', text: 'Record the decision.' }], toolCalls: [] },
+      { role: 'assistant', content: [{ type: 'text', text: 'Preserved architectural decision.' }], toolCalls: [] },
+    ] });
+    const execution = explicitBinding ? resolveExecutionBinding({ executor: 'codex-app-server' }, undefined, undefined, undefined) : undefined;
+    const copied = filterPromotedDescendantRecords([{
+      type: 'executor.session.updated', ...harness.states.get(externalExecutorKey), executionGeneration: execution?.generation,
+    }]);
+    harness.states.set(externalExecutorKey, {});
+    for (const record of copied) await harness.dispatcher.dispatch(new ExecutorSessionUpdated(ExecutorSessionUpdated.schema.parse(record)));
+    const session = harness.createSession({ ...harness.context, binding: { ...harness.context.binding, execution } });
+    try {
+      await (await session.run({ kind: 'prompt', prompt: 'Continue the decision.' }, { signal: new AbortController().signal })).completion;
+      expect(harness.resumes).toEqual([]);
+      expect(harness.starts).toHaveLength(1);
+      expect(JSON.stringify(harness.prompts)).toContain('Preserved architectural decision.');
+      expect(harness.events.find((event) => event instanceof ExecutorTurnMetadata)).toMatchObject({ resumeMode: 'handoff' });
+      expect(harness.states.get(externalExecutorKey).sessionRef?.ref['copiedIdentity']).toBeUndefined();
+    } finally { await session.shutdown(); }
   });
 
   it('falls back to a fresh thread only for protocol resume failures', async () => {

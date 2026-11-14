@@ -3,8 +3,13 @@ import { describe, expect, it } from 'vitest';
 import type { WireRecord } from '#/wire/record';
 import { sliceMainRecordsAtTurn } from '#/workspace/sessionLifecycle/internal/forkTurnSlice';
 import {
+  collectPromotedDescendantIds,
+  filterPromotedDescendantRecords,
   filterPromotedRecords,
+  normalizePromotedDescendantMeta,
+  normalizePromotedTaskDocument,
   retargetPromotedRecords,
+  settlePromotedWireRecords,
   sliceSettledAgentRecords,
 } from '#/workspace/sessionLifecycle/internal/promoteAgent';
 
@@ -140,13 +145,14 @@ describe('promoted subagent records', () => {
     expect(sliceSettledAgentRecords(records).lastTurnReason).toBe('failed');
   });
 
-  it('drops source-runtime records, the remote executor session and actual session-scoped approval grants', () => {
+  it('drops source-runtime records, the remote executor session and session-scoped approval grants while keeping subagent and task facts', () => {
     const kept = filterPromotedRecords([
       user('u1', 'task', 1),
       { type: 'profile.bind', time: 2 },
       { type: 'prompt.enqueued', time: 3 },
       { type: 'task.started', time: 4 },
       { type: 'subagent.spawned', time: 5 },
+      { type: 'subagent.autonomous_receipt_delivered', turnId: 0, time: 5 },
       { type: 'cron.add', time: 6 },
       { type: 'executor.session.updated', time: 7, sessionRef: { ref: { sessionId: 'remote-1' } } },
       { type: 'permission.record_approval_result', time: 8, sessionApprovalRule: 'Write', result: { decision: 'approved', scope: 'session' } },
@@ -156,9 +162,304 @@ describe('promoted subagent records', () => {
       { type: 'tools.update_store', time: 12, key: 'todo', value: [{ title: 'ship', status: 'in_progress' }] },
     ]);
     expect(kept.map((record) => record.type)).toEqual([
-      'context.append_message', 'permission.record_approval_result', 'permission.record_approval_result',
+      'context.append_message', 'task.started', 'subagent.spawned',
+      'permission.record_approval_result', 'permission.record_approval_result',
       'permission.record_approval_result', 'tools.update_store',
     ]);
+  });
+
+  it('collects transitive descendants and branches while reparenting direct children to main', () => {
+    const collected = collectPromotedDescendantIds({
+      main: { type: 'main' },
+      'agent-root': { type: 'sub', delegator: { kind: 'agent', agentId: 'main' } },
+      'agent-sibling': { type: 'sub', delegator: { kind: 'agent', agentId: 'main' } },
+      'agent-child': { type: 'sub', delegator: { kind: 'agent', agentId: 'agent-root' } },
+      'agent-branch': { type: 'sub', forkedFrom: 'agent-root', labels: { branch: 'true' } },
+      'agent-grandchild': { type: 'sub', delegator: { kind: 'agent', agentId: 'agent-child' } },
+      'agent-external': { type: 'sub', parentAgentId: 'agent-root', delegator: { kind: 'external', delegationId: 'ext-1' } },
+    }, 'agent-root');
+    expect(collected.map((item) => ({ id: item.agentId, parent: item.parentAgentId }))).toEqual([
+      { id: 'agent-child', parent: 'main' },
+      { id: 'agent-branch', parent: 'main' },
+      { id: 'agent-grandchild', parent: 'agent-child' },
+    ]);
+  });
+
+  it('reparents promoted wire records, settles open tasks and subagents, and seals open descendant state', () => {
+    const mainSettled = settlePromotedWireRecords([
+      {
+        type: 'subagent.spawned',
+        subagentId: 'agent-done',
+        taskId: 'subagent-done-12345678',
+        parentAgentId: 'agent-root',
+        callerAgentId: 'agent-root',
+        parentToolCallId: 'call-1',
+        runInBackground: true,
+        time: 10,
+      },
+      {
+        type: 'subagent.completed',
+        subagentId: 'agent-done',
+        taskId: 'subagent-done-12345678',
+        resultSummary: 'Done.',
+        time: 12,
+      },
+      {
+        type: 'subagent.spawned',
+        subagentId: 'agent-open',
+        taskId: 'subagent-open-87654321',
+        parentAgentId: 'agent-root',
+        callerAgentId: 'agent-root',
+        parentToolCallId: 'call-2',
+        runInBackground: true,
+        time: 14,
+      },
+      {
+        type: 'task.started',
+        info: {
+          taskId: 'subagent-open-87654321',
+          kind: 'agent',
+          agentId: 'agent-open',
+          ownerAgentId: 'agent-root',
+          description: 'Open child',
+          status: 'running',
+          startedAt: 14,
+          endedAt: null,
+        },
+        time: 14,
+      },
+      {
+        type: 'usage.record',
+        model: 'm1',
+        agentId: 'agent-root',
+        parentAgentId: 'main',
+        usage: { inputOther: 5, output: 3, inputCacheRead: 0, inputCacheCreation: 0 },
+        time: 15,
+      },
+    ], { sourceRootAgentId: 'agent-root', targetAgentId: 'main' });
+
+    expect([...mainSettled.tasks.keys()]).toEqual(['subagent-open-87654321']);
+    expect(mainSettled.records[0]).toMatchObject({
+      type: 'subagent.spawned',
+      parentAgentId: 'main',
+      callerAgentId: 'main',
+    });
+    expect(mainSettled.records[4]).toMatchObject({
+      type: 'usage.record',
+      agentId: 'main',
+    });
+    expect(mainSettled.records[4]!['parentAgentId']).toBeUndefined();
+    expect(mainSettled.records).toContainEqual({
+      type: 'task.terminated',
+      info: {
+        taskId: 'subagent-open-87654321',
+        kind: 'agent',
+        agentId: 'agent-open',
+        ownerAgentId: 'main',
+        description: 'Open child',
+        status: 'killed',
+        startedAt: 14,
+        endedAt: 15,
+        terminalNotificationSuppressed: true,
+      },
+      time: 15,
+    });
+    expect(mainSettled.records).toContainEqual({
+      type: 'subagent.failed',
+      subagentId: 'agent-open',
+      taskId: 'subagent-open-87654321',
+      error: 'terminated',
+      time: 15,
+    });
+
+    const descendantFiltered = filterPromotedDescendantRecords([
+      { type: 'profile.bind', profile: 'worker', time: 1 },
+      { type: 'executor.session.updated', executorId: 'example-acp', descriptorRevision: 'r1', sessionEpoch: 1,
+        sessionRef: { executorId: 'example-acp', version: 1, ref: { sessionId: 'remote-child' } }, time: 2 },
+      { type: 'branch.base', version: 1, parentAgentId: 'agent-root', seed: 'verbatim', inheritedCount: 2, time: 3 },
+      { type: 'turn.prompt', turnId: 0, parentReceiptManaged: false, time: 4 },
+      {
+        type: 'context.append_message',
+        time: 5,
+        message: { role: 'assistant', source: { turnId: 0 }, content: [{ type: 'text', text: 'Autonomous reply' }] },
+      },
+      { type: 'turn.ended', turnId: 0, reason: 'completed', time: 6 },
+    ]);
+    expect(descendantFiltered.some((record) => record.type === 'profile.bind')).toBe(true);
+    expect(descendantFiltered.find((record) => record.type === 'executor.session.updated')).toMatchObject({
+      sessionRef: { executorId: 'example-acp', version: 1, ref: { copiedIdentity: true } },
+    });
+    expect(JSON.stringify(descendantFiltered)).not.toContain('remote-child');
+
+    const descendantSettled = settlePromotedWireRecords(descendantFiltered, {
+      sourceRootAgentId: 'agent-root',
+      targetAgentId: 'agent-branch',
+      isDescendant: true,
+      isUnsealedBranch: true,
+    });
+    expect(descendantSettled.records).toContainEqual(expect.objectContaining({
+      type: 'branch.base',
+      parentAgentId: 'main',
+    }));
+    expect(descendantSettled.records).toContainEqual({
+      type: 'subagent.autonomous_receipt_delivered',
+      turnId: 0,
+      time: 6,
+    });
+    expect(descendantSettled.records).toContainEqual({
+      type: 'agent.branch_sealed',
+      sealed: true,
+      time: 6,
+    });
+
+    const normalizedTask = normalizePromotedTaskDocument({
+      taskId: 'bash-open-12345678',
+      kind: 'process',
+      ownerAgentId: 'agent-root',
+      status: 'running',
+      cleanupPending: true,
+      startedAt: 10,
+      endedAt: null,
+    }, 'agent-root', 20);
+    expect(normalizedTask).toEqual({
+      taskId: 'bash-open-12345678',
+      kind: 'process',
+      ownerAgentId: 'main',
+      status: 'killed',
+      startedAt: 10,
+      endedAt: 20,
+      terminalNotificationSuppressed: true,
+    });
+
+    const normalizedMeta = normalizePromotedDescendantMeta({
+      agentId: 'agent-open',
+      parentAgentId: 'main',
+      agentMeta: {
+        type: 'sub',
+        delegator: { kind: 'agent', agentId: 'agent-root' },
+        labels: { parentAgentId: 'agent-root', requestIdentityRootAgent: 'agent-root', profileName: 'worker' },
+        resultSummary: 'stale',
+      },
+      records: [],
+      wasOpen: true,
+    }, {
+      sourceRootAgentId: 'agent-root',
+      targetAgentHome: '/target/agents/agent-open',
+      settleTime: 25,
+    });
+    expect(normalizedMeta).toEqual({
+      type: 'sub',
+      homedir: '/target/agents/agent-open',
+      parentAgentId: 'main',
+      delegator: { kind: 'agent', agentId: 'main' },
+      status: 'cancelled',
+      completedAt: 25,
+      labels: {
+        parentAgentId: 'main',
+        requestIdentityRootAgent: 'main',
+        profileName: 'worker',
+      },
+    });
+  });
+
+  it.each(['disk', 'wire', 'subagent'] as const)('reconciles a %s-first terminal outcome across task documents, wire, and descendant metadata', (terminalSource) => {
+    const taskId = 'subagent-race-12345678';
+    const info = {
+      taskId, kind: 'agent', agentId: 'agent-child', ownerAgentId: 'agent-root',
+      description: 'Finish slice', status: 'running', startedAt: 10, endedAt: null,
+    };
+    const terminal = { ...info, status: 'completed', endedAt: 20 };
+    const records: WireRecord[] = [
+      { type: 'subagent.spawned', subagentId: 'agent-child', taskId, time: 10 },
+      { type: 'task.started', info, time: 10 },
+    ];
+    if (terminalSource === 'wire') records.push({ type: 'task.terminated', info: terminal, time: 20 });
+    if (terminalSource === 'subagent') records.push({ type: 'subagent.completed', subagentId: 'agent-child', taskId, resultSummary: 'Slice finished.', time: 20 });
+    const settled = settlePromotedWireRecords(records, {
+      sourceRootAgentId: 'agent-root', targetAgentId: 'main',
+      taskDocuments: new Map([[taskId, {
+        info: terminalSource === 'disk' ? terminal : info,
+        output: new TextEncoder().encode('Slice finished.'),
+      }]]),
+    });
+    const outcome = settled.tasks.get(taskId)!.info;
+    expect(outcome).toMatchObject({ status: 'completed', endedAt: 20, ownerAgentId: 'main', terminalNotificationSuppressed: true });
+    expect(settled.records.filter((record) => record.type === 'task.terminated')).toEqual([
+      expect.objectContaining({ info: outcome }),
+    ]);
+    expect(settled.records.filter((record) => record.type === 'subagent.completed' || record.type === 'subagent.failed')).toEqual([
+      expect.objectContaining({ type: 'subagent.completed', subagentId: 'agent-child', taskId, resultSummary: 'Slice finished.', time: 20 }),
+    ]);
+    expect(normalizePromotedDescendantMeta({
+      agentId: 'agent-child', parentAgentId: 'main',
+      records: [{ type: 'turn.prompt', turnId: 0, time: 10 }], wasOpen: true,
+      agentMeta: { type: 'sub', taskId, status: 'failed', error: 'stale failure' },
+    }, {
+      sourceRootAgentId: 'agent-root', targetAgentHome: '/target/agents/agent-child', settleTime: 30,
+      outcome: settled.agentOutcomes.get('agent-child'),
+    })).toMatchObject({ taskId, status: 'completed', completedAt: 20, resultSummary: 'Slice finished.', error: undefined });
+  });
+
+  it.each([{ startedAt: 20, selfReceipt: true }, { startedAt: 30, selfReceipt: false }])('preserves a newer cancelled turn starting at $startedAt over its preceding completed receipt', ({ startedAt, selfReceipt }) => {
+    const taskId = 'agent-receipt-12345678';
+    const resultSummary = 'Previous turn finished.';
+    const records: WireRecord[] = [
+      { type: 'turn.prompt', turnId: 0, time: 10 },
+      { type: 'turn.ended', turnId: 0, reason: 'completed', time: 20 },
+    ];
+    if (selfReceipt) records.push({ type: 'subagent.completed', subagentId: 'agent-child', taskId, resultSummary, time: 20 });
+    records.push(
+      { type: 'turn.prompt', turnId: 1, time: startedAt },
+      { type: 'turn.ended', turnId: 1, reason: 'cancelled', time: 40 },
+    );
+    const normalized = normalizePromotedDescendantMeta({
+      agentId: 'agent-child', parentAgentId: 'main', wasOpen: true, lastTurnReason: 'cancelled', records,
+      agentMeta: { type: 'sub', taskId, status: 'completed', completedAt: 20, resultSummary, error: 'stale error' },
+    }, {
+      sourceRootAgentId: 'agent-root', targetAgentHome: '/target/agents/agent-child', settleTime: 40,
+      outcome: { taskId, status: 'completed', completedAt: 20, resultSummary },
+    });
+    expect(normalized).toMatchObject({ taskId, status: 'cancelled', completedAt: 40 });
+    expect(normalized.resultSummary).toBeUndefined();
+    expect(normalized.error).toBeUndefined();
+  });
+
+  it.each(['completed', 'failed', 'killed', 'timed_out', 'lost'])('uses the committed %s task outcome over a conflicting wire outcome', (status) => {
+    const taskId = 'subagent-conflict-12345678';
+    const info = {
+      taskId, kind: 'agent', agentId: 'agent-child', ownerAgentId: 'agent-root',
+      description: 'Historical task', status: 'completed', startedAt: 10, endedAt: 20,
+    };
+    const settled = settlePromotedWireRecords([
+      { type: 'subagent.completed', subagentId: 'agent-child', taskId, resultSummary: 'Old result.', time: 20 },
+      { type: 'task.terminated', info, time: 20 },
+    ], {
+      sourceRootAgentId: 'agent-root', targetAgentId: 'main',
+      taskDocuments: new Map([[taskId, { info: { ...info, status, endedAt: 30, stopReason: 'Committed outcome' } }]]),
+    });
+    expect(settled.tasks.get(taskId)?.info).toMatchObject({ status, endedAt: 30 });
+    expect(settled.records.find((record) => record.type === 'task.terminated')?.['info']).toEqual(settled.tasks.get(taskId)?.info);
+    expect(settled.agentOutcomes.get('agent-child')).toMatchObject({
+      status: status === 'completed' ? 'completed' : status === 'killed' ? 'cancelled' : 'failed',
+      completedAt: 30,
+      error: status === 'completed' ? undefined : status === 'killed' ? 'terminated' : 'Committed outcome',
+    });
+  });
+
+  it('ends a delayed task start with the same reconciled terminal outcome', () => {
+    const taskId = 'subagent-late-12345678';
+    const info = {
+      taskId, kind: 'agent', agentId: 'agent-child', ownerAgentId: 'agent-root',
+      description: 'Historical task', status: 'completed', startedAt: 10, endedAt: 20,
+    };
+    const settled = settlePromotedWireRecords([
+      { type: 'task.terminated', info, time: 20 },
+      { type: 'task.started', info: { ...info, status: 'running', endedAt: null }, time: 30 },
+    ], { sourceRootAgentId: 'agent-root', targetAgentId: 'main' });
+    expect(settled.records.findLast((record) => record.type.startsWith('task.'))).toMatchObject({
+      type: 'task.terminated', info: { taskId, status: 'completed', endedAt: 20 },
+    });
+    expect(settled.tasks.get(taskId)?.info).toMatchObject({ status: 'completed', endedAt: 20 });
   });
 
   it('points blob references at the promoted main agent and collects foreign blobs and media ids', () => {
