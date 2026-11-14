@@ -384,6 +384,14 @@ describe('CockpitOverview', () => {
     expect(gaugeLabels).toEqual(['Context', 'Cache hits']);
   });
 
+  it('shows the compact tree token total next to cost and turns', async () => {
+    await render({ figures: { totalTokens: 700 }, treeFigures: { totalTokens: 4_600 }, turns: 12 });
+    expect(q('[data-cockpit-fact="tokens"] dd')?.textContent).toBe('5k');
+    expect(q('[data-cockpit-fact="turns"] dd')?.textContent).toBe('12');
+    await render({ figures: {}, treeFigures: { incomplete: true } });
+    expect(q('[data-cockpit-fact="tokens"] dd')?.textContent).toBe('—');
+  });
+
   it('marks a partly reported session rather than printing a full total', async () => {
     await render({
       forest: forestOf([node(MAIN_AGENT_ID, { childIds: ['a'] }), node('a', { parentAgentId: MAIN_AGENT_ID })]),

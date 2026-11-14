@@ -1141,8 +1141,9 @@ describe('GET /api/agents', () => {
     await metadata.updateAgent('main', (current) => ({ ...current, executorAuth: live.executor_auth }));
     await manager.close(created.data.id);
     const cold = await read();
-    expect(cold).toMatchObject({ context: 'live', live: false, available: false,
-      unavailable_reason_code: 'session_or_agent_not_live' });
+    expect(cold).toMatchObject({ context: 'live', live: false, available: true });
+    expect(cold.tools).toBeDefined();
+    expect(cold.skills).toBeDefined();
     expect(cold.executor_auth).toEqual(live.executor_auth);
     expect(manager.get(created.data.id)).toBeUndefined();
     const invocations = (await readFile(join(home!, 'codex-fixture-invocations'), 'utf8')).trim().split('\n');
@@ -1173,9 +1174,11 @@ describe('GET /api/agents', () => {
     expect(body.code).toBe(0);
     const data = agentCapabilitiesResponseSchema.parse(body.data);
     expect(data).toMatchObject({
-      live: false, available: false, unavailable_reason_code: 'session_or_agent_not_live',
+      live: false, available: true, profile: { name: 'agent', model: 'stub' },
     });
-    expect(data.unavailable_reason).toContain('not live');
+    expect(data.tools?.length).toBeGreaterThan(0);
+    expect(data.skills).toBeDefined();
+    expect(data.targets.length).toBeGreaterThan(0);
     expect(manager.get(created.data.id)).toBeUndefined();
   });
 
@@ -1267,8 +1270,8 @@ describe('GET /api/agents', () => {
     expect(snapshot.profile?.source_file).toBe(live.profile?.source_file);
     expect(snapshot.targets).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        launch_allowed: false, launch_unavailable_reason: expect.stringContaining('not live'),
-        launch_unavailable_reason_code: 'snapshot_launch_unavailable',
+        launch_allowed: false, launch_unavailable_reason: expect.any(String),
+        launch_unavailable_reason_code: expect.stringMatching(/agent_run_inactive|strict_subagent_policy_blocked/),
       }),
     ]));
     expect(snapshot.tools?.length).toBeGreaterThan(0);

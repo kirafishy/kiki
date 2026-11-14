@@ -64,6 +64,7 @@ const harness = vi.hoisted(() => ({
   promoteAgent: vi.fn(),
   promoteAvailable: false,
   mountRealRail: false,
+  railState: undefined as import('@kiki/session-core/session').SessionViewState | undefined,
   transcriptRenders: 0,
   mediaProviderProps: [] as Array<{ apiRef?: unknown }>,
   host: { kind: 'browser' } as {
@@ -160,8 +161,10 @@ vi.mock('../RightRail', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../RightRail')>();
   return {
     ...actual,
-    RightRail: (props: ComponentProps<typeof actual.RightRail>) =>
-      harness.mountRealRail ? <actual.RightRail {...props} /> : null,
+    RightRail: (props: ComponentProps<typeof actual.RightRail>) => {
+      harness.railState = props.state;
+      return harness.mountRealRail ? <actual.RightRail {...props} /> : null;
+    },
   };
 });
 vi.mock('../../host', () => ({ useHost: () => harness.host }));
@@ -2026,6 +2029,23 @@ function renderWorkspace(overrides: Partial<ComponentProps<typeof AgentWorkspace
     </QueryClientProvider>,
   ));
 }
+
+it('passes the session shell to a loaded child rail without replacing the child usage', async () => {
+  const forest = testForest();
+  const child = { ...createViewState('session'), loaded: true, transcriptReady: true,
+    usage: { total: { inputOther: 100, output: 20, inputCacheRead: 30, inputCacheCreation: 10 } } };
+  const session = { id: 'session', workspace_id: 'example-workspace', metadata: { cwd: 'E:/example' } } as NonNullable<typeof child.session>;
+  const railSlot = document.createElement('div');
+  await renderWorkspace({ controller: controllerStub({ forest, agentStates: { child } }), forest, railOpen: true,
+    slots: { header, dock, rail: railSlot, heroFooter: null, footer: null, preview: null },
+    sessionState: { ...createViewState('session'), loaded: true, session } });
+  const rail = harness.railState!;
+  expect(rail.session).toBe(session);
+  expect(rail.session?.workspace_id).toBe('example-workspace');
+  expect(rail.session?.metadata.cwd).toBe('E:/example');
+  expect(rail.loaded).toBe(true);
+  expect(rail.usage).toEqual(child.usage);
+});
 
 it('releases per-agent transcript observation while an embedded tab is hidden', async () => {
   const release = vi.fn();

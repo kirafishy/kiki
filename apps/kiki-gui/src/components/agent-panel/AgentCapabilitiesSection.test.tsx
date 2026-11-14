@@ -217,6 +217,7 @@ async function render(
     capabilitiesStatus?: CapabilitiesStatus;
     onRetryCapabilities?: () => void;
     capabilityGaps?: readonly CapabilityGapKind[];
+    subagentTargets?: readonly AgentSubagentTarget[];
   } = {},
 ): Promise<void> {
   await act(async () => {
@@ -224,7 +225,7 @@ async function render(
       <I18nProvider>
         {/* The rail host: one scroll region, the value this slice must restore. */}
         <div data-agent-panel-scroll>
-          <AgentCapabilitiesSection tools={tools} skills={skills} subagentTargets={TARGETS} {...options} />
+          <AgentCapabilitiesSection tools={tools} skills={skills} subagentTargets={options.subagentTargets ?? TARGETS} {...options} />
         </div>
       </I18nProvider>,
     );
@@ -293,6 +294,51 @@ describe('capability tool groups', () => {
     // An unknown category keeps its raw token: there is no per-tool dictionary.
     await render([...TOOLS, tool('MysteryTool', 'zeta-domain', 'enabled')]);
     expect(chip('builtin:zeta-domain').textContent).toContain('zeta-domain');
+  });
+
+  it('counts snapshot and draft inventory tools as on while a generic unknown MCP tool stays unknown', async () => {
+    vi.useFakeTimers();
+    const inventoryTools = [
+      tool('SnapshotRead', 'snapshot', 'unknown', { unavailableReasonCode: 'snapshot_inventory_only' }),
+      tool('DraftRead', 'draft', 'unknown', { unavailableReasonCode: 'draft_inventory_only' }),
+      tool('mcp__generic__unknown_tool', 'mcp', 'unknown', { source: 'mcp' }),
+    ];
+    await render(inventoryTools);
+
+    expect(chip('builtin:snapshot').dataset['capabilityGroupCount']).toBe('1/1');
+    expect(chip('builtin:draft').dataset['capabilityGroupCount']).toBe('1/1');
+    expect(chip('mcp:generic').dataset['capabilityGroupCount']).toBe('0/1');
+    expect(chip('mcp:generic').textContent).toContain('?/1');
+
+    await act(async () => chip('builtin:snapshot').dispatchEvent(new FocusEvent('focusin', { bubbles: true, relatedTarget: null })));
+    expect(document.querySelector('[data-capability-group-preview="builtin:snapshot"]')?.textContent).toContain('1/1 开启');
+    await act(async () => chip('mcp:generic').dispatchEvent(new FocusEvent('focusin', { bubbles: true, relatedTarget: null })));
+    expect(document.querySelector('[data-capability-group-preview="mcp:generic"]')?.textContent).toContain('?/1 开启');
+  });
+
+  it('shows snapshot inventory counts in the tabs while disabled skills and a leaf-disabled target stay out', async () => {
+    const inventoryTools = [tool('SnapshotRead', 'snapshot', 'unknown', { unavailableReasonCode: 'snapshot_inventory_only' })];
+    const skills: AgentSkillCapability[] = [
+      { id: 'snapshot:snapshot-skill', name: 'snapshot-skill', scope: 'workspace', state: 'unknown', unavailableReasonCode: 'snapshot_inventory_only' },
+      { id: 'disabled-invocation', name: 'disabled-invocation', scope: 'global', state: 'enabled', disableModelInvocation: true },
+      { id: 'disabled-skill', name: 'disabled-skill', scope: 'global', state: 'disabled' },
+    ];
+    const subagentTargets: AgentSubagentTarget[] = [
+      { profile: 'snapshot-worker', executor: 'native', defaultsAvailable: true, launchAllowed: false, launchUnavailableReasonCode: 'snapshot_launch_unavailable' },
+      { profile: 'leaf-disabled', executor: 'native', defaultsAvailable: false, unavailableReasonCode: 'agent_run_inactive', launchAllowed: false, launchUnavailableReasonCode: 'agent_run_inactive' },
+    ];
+    await render(inventoryTools, skills, { subagentTargets });
+
+    expect(container.querySelector('[data-capability-tab-button="tools"]')?.textContent).toContain('1');
+    expect(container.querySelector('[data-capability-tab-button="skills"]')?.textContent).toContain('1');
+    expect(container.querySelector('[data-capability-tab-button="subagents"]')?.textContent).toContain('1');
+    await tab('subagents');
+    expect(container.querySelector('[data-capability-item="snapshot-worker"]')).not.toBeNull();
+    expect(container.querySelector('[data-capability-item="leaf-disabled"]')).not.toBeNull();
+
+    await render([], [], { subagentTargets: [subagentTargets[1]!] });
+    expect(container.querySelector('[data-capability-tab-button="subagents"]')?.textContent).toContain('0');
+    expect(container.querySelector('[data-capability-item="leaf-disabled"]')).not.toBeNull();
   });
 
   it('shows the group name and x/y on the chip, and keeps the state words in the accessible name', async () => {
@@ -787,7 +833,7 @@ describe('the observation tabs and read states', () => {
     await render(TOOLS);
     expect(container.querySelectorAll('[data-capability-tab-button]')).toHaveLength(3);
     expect(container.querySelector('[data-capability-tab-button="plugins"]')).toBeNull();
-    expect(container.querySelector('[data-capability-tab-button="tools"]')!.textContent).toContain('16');
+    expect(container.querySelector('[data-capability-tab-button="tools"]')!.textContent).toContain('11');
     expect(container.querySelector('[data-capability-group-chip="plugin:release_kit"]')).not.toBeNull();
   });
 
@@ -801,7 +847,7 @@ describe('the observation tabs and read states', () => {
   it('says a failed read in one quiet line per tab, with a retry', async () => {
     const retry = vi.fn();
     await render(TOOLS, SKILLS, { capabilitiesStatus: 'failed', onRetryCapabilities: retry });
-    expect(container.querySelector('[data-capability-tab-button="tools"]')!.textContent).not.toContain('16');
+    expect(container.querySelector('[data-capability-tab-button="tools"]')!.textContent).not.toContain('11');
     const line = container.querySelector<HTMLElement>('[data-rail-capabilities-unavailable]')!;
     expect(line.textContent).toContain('暂时读不到能力信息');
     await click(line.querySelector('button')!);
@@ -816,13 +862,13 @@ describe('the observation tabs and read states', () => {
     await render(TOOLS, SKILLS, { capabilitiesStatus: 'loading' });
     expect(text('[data-rail-capabilities-unavailable]')).toContain('正在读取能力');
     expect(container.querySelector('[data-rail-capabilities-retry]')).toBeNull();
-    expect(container.querySelector('[data-capability-tab-button="tools"]')!.textContent).not.toContain('16');
+    expect(container.querySelector('[data-capability-tab-button="tools"]')!.textContent).not.toContain('11');
   });
 
   it('keeps the answered tabs when one field is missing; only the missing tab carries the quiet line', async () => {
     const retry = vi.fn();
     await render(TOOLS, SKILLS, { capabilityGaps: ['skills'], onRetryCapabilities: retry });
-    expect(container.querySelector('[data-capability-tab-button="tools"]')!.textContent).toContain('16');
+    expect(container.querySelector('[data-capability-tab-button="tools"]')!.textContent).toContain('11');
     expect(container.querySelector('[data-capability-tab-button="skills"]')!.textContent).not.toContain('1');
     expect(container.querySelector('[data-capability-group-chip]')).not.toBeNull();
     await tab('skills');

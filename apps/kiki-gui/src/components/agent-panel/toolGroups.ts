@@ -64,6 +64,11 @@ export function toolShortName(name: string): string {
   return match?.[1] ?? name;
 }
 
+export function isInventoryTool(tool: AgentToolCapability): boolean {
+  return tool.state === 'unknown' && (tool.unavailableReasonCode === 'snapshot_inventory_only' ||
+    tool.unavailableReasonCode === 'draft_inventory_only');
+}
+
 /** Group every reported tool by raw category or origin, in first-appearance order. */
 export function toolGroups(tools: readonly AgentToolCapability[]): readonly ToolGroup[] {
   const groups = new Map<string, {
@@ -105,7 +110,7 @@ export function toolGroups(tools: readonly AgentToolCapability[]): readonly Tool
       if (tool.state === 'approval-required') counts.approvalRequired += 1;
       else counts[tool.state] += 1;
     }
-    counts.on = counts.enabled + counts.approvalRequired;
+    counts.on = counts.enabled + counts.approvalRequired + group.tools.filter(isInventoryTool).length;
     return { ...group, counts };
   });
 }
@@ -138,7 +143,7 @@ export function toolGroupPreview(group: ToolGroup, limit = 5): ToolGroupPreview 
   let unknownCount = 0;
   for (const tool of group.tools) {
     const name = group.extension ? toolShortName(tool.name) : tool.name;
-    switch (toolStateBucket(tool.state)) {
+    switch (isInventoryTool(tool) ? 'on' : toolStateBucket(tool.state)) {
       case 'on': onNames.push(name); break;
       case 'off': offNames.push(name); break;
       case 'disconnected': disconnectedNames.push(name); break;

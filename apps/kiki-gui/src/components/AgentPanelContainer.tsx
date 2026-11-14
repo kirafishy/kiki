@@ -18,7 +18,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import type { I18nKey } from '@kiki/session-core/i18n';
 import type { AgentForest, ApprovalBlock, QuestionBlock, SessionController, SessionViewState } from '@kiki/session-core/session';
 import { MAIN_AGENT_ID, snapshotSubagentAgentId } from '@kiki/session-core/session';
-import { sumAgentTreeMetrics, UNKNOWN_AGENT_PANEL_METRICS } from '@kiki/session-core/session/agentPanel';
+import { panelTotalTokens, projectedAgentPanelMetrics, sumAgentTreeMetrics, UNKNOWN_AGENT_PANEL_METRICS } from '@kiki/session-core/session/agentPanel';
 import type { AgentPanelMetrics } from '@kiki/protocol';
 import type { TranscriptTodoNotes, TranscriptTodoNotesMeta } from '@kiki/transcript';
 import { useConnection, useOptionalControllerRegistry } from '../state/connection';
@@ -48,8 +48,9 @@ import {
   mapPanelSubagentTargets,
   mapPanelTools,
 } from './agent-panel/mapCapabilities';
-import { isCompletePanelMetrics, isUnsettledPanelMetrics, panelMetricsCapabilitiesKey, panelMetricsContinuationDelay, panelMetricsSettleKey, panelMetricsSourceRevision } from './agent-panel/panelMetricsQuery';
+import { hasMeasuredPanelMetrics, isCompletePanelMetrics, isUnsettledPanelMetrics, panelMetricsCapabilitiesKey, panelMetricsContinuationDelay, panelMetricsSettleKey, panelMetricsSourceRevision } from './agent-panel/panelMetricsQuery';
 import { useAgentPanelCatalog } from './agent-panel/useAgentPanelCatalog';
+import { useCanonicalSessionUsage } from './agent-panel/useCanonicalSessionUsage';
 
 const EMPTY_PANEL_METRICS: Readonly<Record<string, AgentPanelMetrics>> = {};
 
@@ -66,7 +67,11 @@ type KeptPanelMetric = {
 };
 
 function preferMetric(previous: KeptPanelMetric | undefined, next: KeptPanelMetric): KeptPanelMetric {
-  if (previous === undefined || previous.revision !== next.revision) return next;
+  if (previous === undefined) return next;
+  if (previous.revision !== next.revision) {
+    if (previous.stamp > next.stamp || hasMeasuredPanelMetrics(previous.metrics) && !hasMeasuredPanelMetrics(next.metrics)) return previous;
+    return next;
+  }
   const complete = isCompletePanelMetrics(previous.metrics);
   if (complete !== isCompletePanelMetrics(next.metrics)) return complete ? previous : next;
   const measured = (row: AgentPanelMetrics) => [row.totalTokens, row.totalCostUsd, row.inputTokens, row.outputTokens].some((value) => value !== null);
@@ -300,11 +305,9 @@ export function AgentPanelContainer({ state, forest, agentId, visible = true, pa
   const active = agentState?.busy === true || node?.busy === true ||
     (agentId === MAIN_AGENT_ID && Object.values(forest.byId).some((entry) => entry.busy));
   const metricsWanted = part === 'all' || part === 'overview' || part === 'usage';
-  const [expandedIdentity, setExpandedIdentity] = useState<string | undefined>();
-  const profileExpanded = expandedIdentity === identityKey;
   const catalog = useAgentPanelCatalog(part === 'all' || part === 'profile'
     ? { session_id: state.sessionId, agent_id: agentId } : undefined,
-  visible && state.loaded && !state.resyncing && (part === 'all' || profileExpanded),
+  visible && state.loaded && !state.resyncing,
   JSON.stringify([agentState?.profile, agentState?.model, agentState?.permissionMode, agentState?.planMode]));
   const header = useQuery({
     queryKey: panelMetricsCapabilitiesKey(query, connection.spaceKey, connection.scopeId, connection.meta?.server_id ?? ''),
@@ -376,8 +379,9 @@ export function AgentPanelContainer({ state, forest, agentId, visible = true, pa
     const headerValue = raw === undefined ? undefined : headerRow(id, raw);
     const accepted = previous?.revision === revision ? previous : undefined;
     const row = headerValue?.revision === revision ? preferMetric(accepted, headerValue) : accepted;
-    const subtotal = row?.metrics ?? previous?.metrics ?? raw;
-    if (subtotal !== undefined) metrics[id] = row === undefined ? countingMetric(subtotal) : subtotal;
+    const subtotal = hasMeasuredPanelMetrics(row?.metrics) ? row?.metrics
+      : hasMeasuredPanelMetrics(previous?.metrics) ? previous?.metrics : row?.metrics ?? previous?.metrics ?? raw;
+    if (subtotal !== undefined) metrics[id] = row === undefined || subtotal !== row.metrics ? countingMetric(subtotal) : subtotal;
     if ((!rosterPending || id === agentId) && isUnsettledPanelMetrics(row?.metrics)) requestIds.push(id);
   }
   const canSettle = metricsWanted && visible && state.loaded && !state.resyncing && (header.isSuccess || showsTree && kept.current.byId.size > 0);
@@ -440,8 +444,8 @@ export function AgentPanelContainer({ state, forest, agentId, visible = true, pa
     if (kept.current.identity !== metricsIdentity) return;
     let changed = false;
     const retain = (id: string, revision: string, metrics: AgentPanelMetrics, stamp: number) => {
-      if (currentRevisions.current.get(id) !== revision) return;
       const previous = kept.current.byId.get(id);
+      if (previous !== undefined && previous.revision === currentRevisions.current.get(id) && previous.revision !== revision) return;
       if (previous?.metrics === metrics && previous.revision === revision) return;
       const next = preferMetric(previous, { revision, metrics, stamp });
       if (next === previous) return;
@@ -456,7 +460,7 @@ export function AgentPanelContainer({ state, forest, agentId, visible = true, pa
       }
     }
     for (const [id, row] of Object.entries(headerMetrics)) {
-      if (!isUnsettledPanelMetrics(row)) retain(id, header.data?.sourceRevisions.get(id) ?? '', row, header.dataUpdatedAt);
+      if (hasMeasuredPanelMetrics(row) || !isUnsettledPanelMetrics(row)) retain(id, header.data?.sourceRevisions.get(id) ?? '', row, header.dataUpdatedAt);
     }
     if (changed) updateMetrics((epoch) => epoch + 1);
   }, [header.data, header.dataUpdatedAt, headerMetrics, metricsSettle.data, metricsSettle.dataUpdatedAt, metricsIdentity]);
@@ -483,10 +487,45 @@ export function AgentPanelContainer({ state, forest, agentId, visible = true, pa
   }, [visible, settleBlocked, metricsWanted, state.loaded, state.resyncing, header.refetch, requestToken]);
 
   useEffect(() => () => { settleReadAbort.current?.abort(); }, []);
+  for (const id of ids) {
+    const metric = metrics[id] ?? UNKNOWN_AGENT_PANEL_METRICS;
+    const projected = controller?.getAgentState(id)?.usage?.total ?? forest.byId[id]?.usage?.total ??
+      (controller === undefined && id === MAIN_AGENT_ID && agentId === MAIN_AGENT_ID ? state.usage?.total : undefined);
+    if (panelTotalTokens(metric) === null && projected !== undefined) {
+      metrics[id] = projectedAgentPanelMetrics(metric, projected);
+    }
+  }
   const usage = metrics[agentId] ?? UNKNOWN_AGENT_PANEL_METRICS;
-  const treeComplete = showsTree && !rosterIncomplete && ids.every((id) => !isUnsettledPanelMetrics(metrics[id]) && metrics[id]?.usagePartial !== true && metrics[id]?.costPartial !== true);
+  const treeTokensCovered = showsTree && !rosterIncomplete && ids.every((id) => {
+    const row = metrics[id];
+    return row !== undefined && !isUnsettledPanelMetrics(row) && row.usagePartial !== true && panelTotalTokens(row) !== null;
+  });
+  const treeComplete = treeTokensCovered && ids.every((id) => metrics[id]?.costPartial !== true);
   const treeCounting = showsTree && (rosterPending || requestIds.length > 0 && !metricsSettle.isError);
   const tree = sumAgentTreeMetrics(ids, metrics);
+  const canonical = useCanonicalSessionUsage(metricsWanted && visible && showsTree && !treeTokensCovered, state.sessionId);
+  const matchedSession = sessionState.session?.id === state.sessionId && sessionState.session.private !== true
+    ? sessionState.session
+    : undefined;
+  const sessionAccounting = canonical.usage?.accounting ?? matchedSession?.usage?.accounting;
+  const canonicalTotalTokens = (() => {
+    if (sessionAccounting !== undefined) {
+      const tokens = sessionAccounting.tokens;
+      const sum = tokens.input_other + tokens.input_cache_read + tokens.input_cache_creation + tokens.output;
+      if (!Number.isFinite(sum)) return null;
+      return sum > 0 || (sessionAccounting.complete && sessionAccounting.tokens_unknown !== true) ? sum : null;
+    }
+    if (matchedSession?.usage_error === 'read-failed') return null;
+    const raw = matchedSession?.usage;
+    if (raw === undefined || !known(raw.input_tokens) || !known(raw.cache_read_tokens) || !known(raw.cache_creation_tokens) || !known(raw.output_tokens)) {
+      return null;
+    }
+    const sum = raw.input_tokens + raw.cache_read_tokens + raw.cache_creation_tokens + raw.output_tokens;
+    return sum > 0 ? sum : null;
+  })();
+  if (!treeTokensCovered && canonicalTotalTokens !== null) {
+    tree.totalTokens = tree.totalTokens === null ? canonicalTotalTokens : Math.max(tree.totalTokens, canonicalTotalTokens);
+  }
   const { id: routeSessionId } = useParams<{ id?: string }>();
   const isMain = agentId === MAIN_AGENT_ID;
   const routeMatchesSession = routeSessionId === undefined || routeSessionId === state.sessionId;
@@ -759,8 +798,7 @@ export function AgentPanelContainer({ state, forest, agentId, visible = true, pa
       <p role="status" className="text-[12px] leading-relaxed text-ink-faint">{unavailableReason}</p>
     ) : null;
     return <div data-agent-panel-container data-agent-panel-part="profile">
-      <AgentIdentitySection key={identityKey} {...identityProps} part="profile" capabilities={capabilityBody} capabilitySummary={summary}
-        onExpandedChange={(expanded) => { setExpandedIdentity(expanded ? identityKey : undefined); }} />
+      <AgentIdentitySection key={identityKey} {...identityProps} part="profile" capabilities={capabilityBody} capabilitySummary={summary} />
     </div>;
   }
   return <div data-agent-panel-container className="space-y-5">
@@ -832,7 +870,8 @@ function figuresFrom(usage: AgentTokenUsage, t: Translate): OverviewFigures {
   const cacheRate = agentUsageCacheHitRate(usage);
   return {
     costUsd: known(usage.totalCostUsd) ? usage.totalCostUsd : undefined,
-    totalTokens: known(usage.totalTokens) ? usage.totalTokens : undefined,
+    totalTokens: known(usage.totalTokens) ? usage.totalTokens
+      : known(usage.inputTokens) && known(usage.outputTokens) ? usage.inputTokens + usage.outputTokens : undefined,
     inputTokens: known(usage.inputTokens) ? usage.inputTokens : undefined,
     outputTokens: known(usage.outputTokens) ? usage.outputTokens : undefined,
     cacheRate: cacheRate ?? undefined,

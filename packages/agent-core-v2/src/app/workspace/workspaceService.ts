@@ -42,9 +42,13 @@ export class WorkspaceService implements IWorkspaceService {
   }
 
   async get(id: string): Promise<Workspace | undefined> {
-    const stored = (await this.loadCatalog()).workspaces.find((ws) => ws.id === id);
+    const stored = await this.findRegisteredById(id);
     if (stored !== undefined) return stored;
     await this.ensureMerged();
+    return this.findRegisteredById(id);
+  }
+
+  async findRegisteredById(id: string): Promise<Workspace | undefined> {
     return (await this.loadCatalog()).workspaces.find((ws) => ws.id === id);
   }
 

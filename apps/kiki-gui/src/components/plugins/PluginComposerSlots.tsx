@@ -119,22 +119,51 @@ export async function fetchPluginGuiSlots(
     signal,
   });
   if (response.status === 404) return EMPTY_GUI_SLOTS;
+  if (!response.ok) {
+    throw new ApiError({
+      code: API_CODES.INVALID_RESPONSE,
+      msg: `HTTP ${response.status} — plugin GUI slots request failed`,
+      data: null,
+    });
+  }
   let envelope: unknown = null;
   try {
     envelope = await response.json();
   } catch {
-    return EMPTY_GUI_SLOTS;
+    throw new ApiError({
+      code: API_CODES.INVALID_RESPONSE,
+      msg: `HTTP ${response.status} — invalid plugin GUI slots response`,
+      data: null,
+    });
   }
   if (
     envelope === null ||
     typeof envelope !== 'object' ||
     !('code' in envelope) ||
-    (envelope as { code: unknown }).code !== 0 ||
-    !('data' in envelope)
+    typeof (envelope as { code: unknown }).code !== 'number'
   ) {
-    return EMPTY_GUI_SLOTS;
+    throw new ApiError({
+      code: API_CODES.INVALID_RESPONSE,
+      msg: `HTTP ${response.status} — malformed plugin GUI slots envelope`,
+      data: null,
+    });
   }
-  const rawData = (envelope as { data: unknown }).data;
+  const typedEnvelope = envelope as { code: number; msg?: string; data?: unknown };
+  if (typedEnvelope.code !== 0) {
+    throw new ApiError({
+      code: typedEnvelope.code,
+      msg: typeof typedEnvelope.msg === 'string' ? typedEnvelope.msg : `Plugin GUI slots failed (${typedEnvelope.code})`,
+      data: typedEnvelope.data ?? null,
+    });
+  }
+  if (!('data' in typedEnvelope)) {
+    throw new ApiError({
+      code: API_CODES.INVALID_RESPONSE,
+      msg: `HTTP ${response.status} — missing plugin GUI slots payload`,
+      data: null,
+    });
+  }
+  const rawData = typedEnvelope.data;
   const rawSlots =
     rawData !== null &&
     typeof rawData === 'object' &&
@@ -154,7 +183,13 @@ export async function fetchPluginGuiSlots(
           }),
         };
   const parsed = listPluginGuiSlotsResponseSchema.safeParse(normalizedData);
-  if (!parsed.success) return EMPTY_GUI_SLOTS;
+  if (!parsed.success) {
+    throw new ApiError({
+      code: API_CODES.INVALID_RESPONSE,
+      msg: 'Invalid plugin GUI slots schema',
+      data: null,
+    });
+  }
   if (rawSlots === null) return parsed.data.slots;
   return parsed.data.slots.map((slot, index) => {
     const rawEntry = rawSlots[index];

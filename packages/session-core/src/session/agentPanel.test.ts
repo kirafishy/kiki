@@ -1,10 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { sumAgentTreeMetrics, UNKNOWN_AGENT_PANEL_METRICS } from './agentPanel';
+import { panelTotalTokens, projectedAgentPanelMetrics, sumAgentTreeMetrics, UNKNOWN_AGENT_PANEL_METRICS } from './agentPanel';
 import { AgentTranscript } from '@kiki/transcript';
 import { projectAgentTranscriptView } from './transcript/project';
 import { createViewState } from './transcript/types';
 
 describe('agent panel tree accounting', () => {
+  it('keeps projected usage visible as a partial count with cache input counted once', () => {
+    const projected = projectedAgentPanelMetrics(UNKNOWN_AGENT_PANEL_METRICS, {
+      inputOther: 100, output: 20, inputCacheRead: 50, inputCacheCreation: 30,
+    });
+    expect(projected).toMatchObject({ inputTokens: 180, outputTokens: 20, totalTokens: 200, usagePartial: true, usageComplete: false });
+    expect(panelTotalTokens({ totalTokens: null, inputTokens: 180, outputTokens: 20 })).toBe(200);
+    expect(panelTotalTokens({ totalTokens: null, inputTokens: null, outputTokens: 20 })).toBeNull();
+    expect(sumAgentTreeMetrics(['main'], { main: { ...projected, totalTokens: null } }).totalTokens).toBe(200);
+  });
+
   it('projects independent agent stores even when their todo document ids are identical', () => {
     const main = new AgentTranscript('main');
     const child = new AgentTranscript('child');

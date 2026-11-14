@@ -48,7 +48,7 @@ export function isCompletePanelMetrics(row: SettleMetricRow | undefined): boolea
     .some((value) => value !== null && value !== undefined);
 }
 
-function hasMeasuredUsage(row: SettleMetricRow | undefined): boolean {
+export function hasMeasuredPanelMetrics(row: SettleMetricRow | undefined): boolean {
   return row !== undefined && [row.totalTokens, row.totalCostUsd, row.inputTokens, row.outputTokens]
     .some((value) => value !== null && value !== undefined);
 }
@@ -99,8 +99,8 @@ export function mergePanelMetrics<T extends SettleMetricRow>(
   for (const id of new Set([...Object.keys(header), ...Object.keys(settled)])) {
     const headerRow = header[id];
     const settledRow = settled[id];
-    const headerMeasured = isCompletePanelMetrics(headerRow) || hasMeasuredUsage(headerRow);
-    const settledMeasured = isCompletePanelMetrics(settledRow) || hasMeasuredUsage(settledRow);
+    const headerMeasured = isCompletePanelMetrics(headerRow) || hasMeasuredPanelMetrics(headerRow);
+    const settledMeasured = isCompletePanelMetrics(settledRow) || hasMeasuredPanelMetrics(settledRow);
     const headerNewer = freshness === undefined || freshness.headerStamp >= (freshness.settledStamp[id] ?? -1);
     if (headerMeasured && (!settledMeasured || headerNewer)) merged[id] = headerRow as T;
     else if (settledMeasured) merged[id] = settledRow as T;

@@ -866,4 +866,71 @@ describe('the settings page chooses the declared panel or the generic schema for
     expect(container.querySelector('[data-plugin-settings-manifest-error]')).toBeNull();
     expect(getPluginPanelDocument).toHaveBeenCalledWith('field-notes', 'prefs');
   });
+
+  it('keeps the settings iframe mounted when a background refetch mints a new grant URL for unchanged HTML', async () => {
+    getPluginPanelDocument
+      .mockResolvedValueOnce({ html, url: '/plugin-panel/grant-a' })
+      .mockResolvedValueOnce({ html, url: '/plugin-panel/grant-b' });
+    const container = document.createElement('div');
+    document.body.append(container);
+    containers.push(container);
+    const root = createRoot(container);
+    roots.push(root);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <I18nProvider>
+            <PluginSettingsPanel pluginId="kiki-media" panelId="settings" label="Settings" />
+          </I18nProvider>
+        </QueryClientProvider>,
+      );
+    });
+    const frame = await waitFrame(container);
+    await awaitInit(frame);
+    expect(frame.getAttribute('src')).toBe('https://server.example.test/plugin-panel/grant-a');
+
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['plugin-panel-document'] });
+      await new Promise((done) => setTimeout(done, 0));
+    });
+    expect(getPluginPanelDocument).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('iframe')).toBe(frame);
+    expect(frame.getAttribute('src')).toBe('https://server.example.test/plugin-panel/grant-a');
+  });
+
+  it('adopts a refreshed grant on settings remount when the cached entry exceeds the reuse window', async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(
+      ['plugin-panel-document', 'scope-a', 'server-a', 'kiki-media', 'settings', 'settings'],
+      { html, url: '/plugin-panel/expired-grant' },
+      { updatedAt: Date.now() - 11 * 60_000 },
+    );
+    getPluginPanelDocument.mockResolvedValueOnce({ html, url: '/plugin-panel/fresh-grant' });
+
+    const container = document.createElement('div');
+    document.body.append(container);
+    containers.push(container);
+    const root = createRoot(container);
+    roots.push(root);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <I18nProvider>
+            <PluginSettingsPanel pluginId="kiki-media" panelId="settings" label="Settings" />
+          </I18nProvider>
+        </QueryClientProvider>,
+      );
+      await new Promise((done) => setTimeout(done, 0));
+    });
+    await waitFrame(container);
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      if (container.querySelector('iframe')?.getAttribute('src')?.endsWith('/fresh-grant')) break;
+      await act(async () => { await new Promise((done) => setTimeout(done, 0)); });
+    }
+    expect(getPluginPanelDocument).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('iframe')?.getAttribute('src')).toBe('https://server.example.test/plugin-panel/fresh-grant');
+    queryClient.clear();
+  });
 });

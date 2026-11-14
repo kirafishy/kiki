@@ -162,20 +162,58 @@ function PluginSettingsDocument({ pluginId, panelId, label }: PluginSettingsPane
   const [frameHeight, setFrameHeight] = useState<number | undefined>(undefined);
   useDirtyReporter(`plugin-settings:${pluginId}`, dirty);
   const serverId = meta?.server_id ?? '';
+  const documentIdentity = `${scopeId}\0${serverId}\0${client.baseUrl}\0${pluginId}\0${panelId}`;
   const documentQuery = useQuery({
     queryKey: ['plugin-panel-document', scopeId, serverId, pluginId, panelId, 'settings'],
     queryFn: () => client.getPluginPanelDocument(pluginId, panelId),
-    staleTime: 60_000,
+    staleTime: 5 * 60_000,
+    gcTime: 8 * 60_000,
+    refetchOnWindowFocus: false,
     retry: false,
   });
   const panelDocument = documentQuery.data;
-  const [renderedDocument, setRenderedDocument] = useState(panelDocument);
-  if (!dirty && panelDocument !== undefined && (
-    renderedDocument?.html !== panelDocument.html || renderedDocument?.url !== panelDocument.url
-  )) {
-    setRenderedDocument(panelDocument);
-    setFrameHeight(undefined);
+  const lastObservedRef = useRef<{
+    readonly identity: string;
+    readonly doc: NonNullable<typeof panelDocument>;
+  } | null>(null);
+  if (panelDocument !== undefined && lastObservedRef.current?.doc !== panelDocument) {
+    lastObservedRef.current = { identity: documentIdentity, doc: panelDocument };
   }
+  const freshMintedAt = documentQuery.dataUpdatedAt || Date.now();
+  const [renderedState, setRenderedState] = useState<{
+    readonly identity: string;
+    readonly doc: NonNullable<typeof panelDocument>;
+    readonly needsFreshGrant: boolean;
+  } | undefined>(() =>
+    panelDocument === undefined
+      ? undefined
+      : {
+          identity: documentIdentity,
+          doc: panelDocument,
+          needsFreshGrant: panelDocument.url !== undefined && Date.now() - freshMintedAt >= 8 * 60_000,
+        },
+  );
+  if (!dirty && panelDocument !== undefined) {
+    const identityChanged = renderedState !== undefined && renderedState.identity !== documentIdentity;
+    const staleFromPreviousIdentity = lastObservedRef.current?.identity !== documentIdentity;
+    if (
+      renderedState === undefined ||
+      identityChanged ||
+      renderedState.doc.html !== panelDocument.html ||
+      (renderedState.doc.url === undefined) !== (panelDocument.url === undefined) ||
+      (renderedState.needsFreshGrant && !staleFromPreviousIdentity && panelDocument !== renderedState.doc)
+    ) {
+      setRenderedState({
+        identity: documentIdentity,
+        doc: panelDocument,
+        needsFreshGrant:
+          staleFromPreviousIdentity ||
+          (panelDocument.url !== undefined && Date.now() - freshMintedAt >= 8 * 60_000),
+      });
+      setFrameHeight(undefined);
+    }
+  }
+  const renderedDocument = renderedState?.doc;
 
   const post = useCallback((message: unknown) => {
     const target = frameRef.current?.contentWindow;

@@ -758,7 +758,7 @@ try {
     & {
         $ownerToken = $fixtureToken
         $ast = [Management.Automation.Language.Parser]::ParseFile($hotSwitch, [ref]$null, [ref]$null)
-        foreach ($definition in $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Call-Local', 'Execution', 'Lifecycle') }, $false)) {
+        foreach ($definition in $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Call-Local', 'Execution', 'Lifecycle', 'Try-RuntimeSwitch') }, $false)) {
             . ([scriptblock]::Create($definition.Extent.Text))
         }
         function Invoke-RestMethod {
@@ -769,6 +769,54 @@ try {
         foreach ($method in @('resume', 'cancelPause')) { Assert-Equal 0 (Execution $server 'session' $method) "Cold $method retained a request timeout." }
         foreach ($method in @('read', 'pause')) { Assert-Equal 60 (Execution $server 'session' $method) "$method lost its request timeout." }
         Assert-Equal 60 (Lifecycle $server 'update') 'The lifecycle action lost its request timeout.'
+
+        Add-Type @'
+using System.IO;
+using System.Net;
+public sealed class DesktopHotSwitchTestWebResponse : WebResponse
+{
+    public HttpStatusCode StatusCode { get; set; }
+    public override Stream GetResponseStream() { return Stream.Null; }
+}
+'@
+        $script:runtimeSwitchScenario = $null
+        function Call-Local([object]$Server, [string]$Path, [object]$Body) {
+            switch ($script:runtimeSwitchScenario) {
+                'runtime' { throw [System.Management.Automation.RuntimeException]::new('runtime failure without Response') }
+                'network' { throw [System.Net.WebException]::new('connection failed', [System.Net.WebExceptionStatus]::ConnectFailure) }
+                'http404' {
+                    $response = [DesktopHotSwitchTestWebResponse]::new()
+                    $response.StatusCode = [System.Net.HttpStatusCode]::NotFound
+                    throw [System.Net.WebException]::new('not found', $null, [System.Net.WebExceptionStatus]::ProtocolError, $response)
+                }
+                'http500' {
+                    $response = [DesktopHotSwitchTestWebResponse]::new()
+                    $response.StatusCode = [System.Net.HttpStatusCode]::InternalServerError
+                    throw [System.Net.WebException]::new('server failure', $null, [System.Net.WebExceptionStatus]::ProtocolError, $response)
+                }
+                default { throw "Unknown runtime-switch scenario: $script:runtimeSwitchScenario" }
+            }
+        }
+        $previousVerbosePreference = $VerbosePreference
+        $VerbosePreference = 'Continue'
+        try {
+            foreach ($case in @(
+                @{ name = 'RuntimeException without Response'; scenario = 'runtime'; expectVerbose = $true; message = 'runtime failure without Response' },
+                @{ name = 'network exception with null Response'; scenario = 'network'; expectVerbose = $true; message = 'connection failed' },
+                @{ name = 'HTTP 404 response'; scenario = 'http404'; expectVerbose = $false; message = $null },
+                @{ name = 'HTTP 500 response'; scenario = 'http500'; expectVerbose = $true; message = 'server failure' }
+            )) {
+                $script:runtimeSwitchScenario = $case.scenario
+                $verbose = @(Try-RuntimeSwitch $server 'operation' 'fence' 4>&1 | ForEach-Object { [string]$_ })
+                Assert-Equal $case.expectVerbose ($verbose.Count -gt 0) "$($case.name) produced unexpected verbose output: $($verbose -join ' | ')"
+                if ($case.expectVerbose) {
+                    Assert-Contains $case.message ($verbose -join "`n") "$($case.name) did not report its failure."
+                }
+            }
+        }
+        finally {
+            $VerbosePreference = $previousVerbosePreference
+        }
     }
     $cscPath = Resolve-Csc
     [IO.Directory]::CreateDirectory((Join-Path $homePath 'server\instances')) | Out-Null

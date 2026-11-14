@@ -98,8 +98,10 @@ export function capabilityCounts(
   return {
     toolsOn,
     tools: total,
-    skills: skills.length,
-    subagents: subagentTargets.length,
+    skills: skills.filter((skill) => skill.disableModelInvocation !== true && (skill.state === 'enabled' ||
+      skill.state === 'unknown' && skill.unavailableReasonCode === 'snapshot_inventory_only')).length,
+    subagents: subagentTargets.filter((target) => target.defaultsAvailable !== false && target.unavailableReasonCode === undefined &&
+      (target.launchAllowed !== false || target.launchUnavailableReasonCode === 'snapshot_launch_unavailable')).length,
   };
 }
 
@@ -255,7 +257,7 @@ function GroupChip({
 }) {
   const { t } = useI18n();
   const { counts } = group;
-  const allUnknown = counts.total > 0 && counts.unknown === counts.total;
+  const allUnknown = counts.total > 0 && counts.on === 0 && counts.unknown === counts.total;
   const noneOn = counts.on === 0 && !allUnknown;
   const countLine = toolGroupCountLine(t, counts);
   // The chip shows the ratio alone; "on" on every bubble states what `x/y`
@@ -511,7 +513,7 @@ export const AgentCapabilitiesSection = memo(function AgentCapabilitiesSection({
     ] as const).filter(([, , list]) => list.length > 0);
   }, [skills, query, t]);
 
-  const toolTotal = groups.reduce((sum, group) => sum + group.counts.total, 0);
+  const counts = capabilityCounts(tools, skills, subagentTargets);
   const capReady = capabilitiesStatus === 'ready';
   // A field that never arrived keeps its tab on the failed line; the tabs
   // that answered are not dragged into it.
@@ -521,9 +523,9 @@ export const AgentCapabilitiesSection = memo(function AgentCapabilitiesSection({
   const skillsStatus = statusOf('skills');
   const subagentsStatus = statusOf('subagents');
   const tabs: { id: CapabilityTab; label: string; count: number | undefined }[] = [
-    { id: 'tools', label: t('inspector.cap.tools'), count: toolsStatus === 'ready' ? toolTotal : undefined },
-    { id: 'skills', label: t('inspector.cap.skills'), count: skillsStatus === 'ready' ? skills.length : undefined },
-    { id: 'subagents', label: t('inspector.cap.subagents'), count: subagentsStatus === 'ready' ? subagentTargets.length : undefined },
+    { id: 'tools', label: t('inspector.cap.tools'), count: toolsStatus === 'ready' ? counts.toolsOn : undefined },
+    { id: 'skills', label: t('inspector.cap.skills'), count: skillsStatus === 'ready' ? counts.skills : undefined },
+    { id: 'subagents', label: t('inspector.cap.subagents'), count: subagentsStatus === 'ready' ? counts.subagents : undefined },
   ];
   const current = tabs.find((entry) => entry.id === tab) ?? tabs[0]!;
   // The threshold follows every reported tool, not just the ones that are on:

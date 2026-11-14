@@ -45,6 +45,6 @@ export const mcpDiscoveryKey = defineState('mcp.discovery', (): McpDiscoveryStat
   .replayable({ schema: z.custom<McpDiscoveryState>() })
   .on(McpToolsDiscovered, (s, e) => {
   const key = `${e.serverName}\n${e.hash}`;
-  if (s.seen.includes(key)) return;
-  s.seen = [...s.seen, key];
+  const prefix = `${e.serverName}\n`;
+  s.seen = [...s.seen.filter((entry) => !entry.startsWith(prefix)), key];
 });

@@ -96,4 +96,138 @@ describe('PluginPanelHost document source', () => {
     expect(frame.getAttribute('sandbox')).toBe('allow-scripts');
     expect(frame.getAttribute('sandbox')).not.toContain('allow-same-origin');
   });
+
+  it('preserves the live iframe grant URL across background refetches when HTML is unchanged, and updates when HTML changes', async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    getPluginPanelDocument
+      .mockResolvedValueOnce({ html: '<p>v1</p>', url: '/plugin-panel/grant-1' })
+      .mockResolvedValueOnce({ html: '<p>v1</p>', url: '/plugin-panel/grant-2' })
+      .mockResolvedValueOnce({ html: '<p>v2</p>', url: '/plugin-panel/grant-3' });
+
+    const container = window.document.createElement('div');
+    window.document.body.append(container);
+    containers.push(container);
+    const root = createRoot(container);
+    roots.push(root);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <PluginPanelHost pluginId="plugin-id" panelId="panel-id" />
+        </QueryClientProvider>,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    let frame: HTMLIFrameElement | null = null;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      frame = container.querySelector<HTMLIFrameElement>('iframe');
+      if (frame !== null) break;
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    }
+    expect(frame).not.toBeNull();
+    expect(frame!.getAttribute('src')).toBe('https://server.example.test/plugin-panel/grant-1');
+
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['plugin-panel-document'] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(getPluginPanelDocument).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('iframe')).toBe(frame);
+    expect(frame!.getAttribute('src')).toBe('https://server.example.test/plugin-panel/grant-1');
+
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['plugin-panel-document'] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      if (frame!.getAttribute('src') === 'https://server.example.test/plugin-panel/grant-3') break;
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    }
+    expect(getPluginPanelDocument).toHaveBeenCalledTimes(3);
+    expect(frame!.getAttribute('src')).toBe('https://server.example.test/plugin-panel/grant-3');
+  });
+
+  it('adopts a refreshed grant after remounting with a cached document older than the reuse window', async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(
+      ['plugin-panel-document', 'plugin-id', 'panel-id', ''],
+      { html: '<p>v1</p>', url: '/plugin-panel/expired-grant' },
+      { updatedAt: Date.now() - 11 * 60_000 },
+    );
+    getPluginPanelDocument.mockResolvedValueOnce({ html: '<p>v1</p>', url: '/plugin-panel/fresh-grant' });
+
+    const container = window.document.createElement('div');
+    window.document.body.append(container);
+    containers.push(container);
+    const root = createRoot(container);
+    roots.push(root);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <PluginPanelHost pluginId="plugin-id" panelId="panel-id" />
+        </QueryClientProvider>,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      if (container.querySelector('iframe')?.getAttribute('src')?.endsWith('/fresh-grant')) break;
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    }
+    expect(getPluginPanelDocument).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('iframe')?.getAttribute('src')).toBe('https://server.example.test/plugin-panel/fresh-grant');
+    queryClient.clear();
+  });
+
+  it.each([false, true])('replaces the previous server grant after server generation recovery (endpoint changed: %s)', async (changeEndpoint) => {
+    const bag = connection as typeof connection & { scopeId?: string; meta?: { server_id: string } };
+    bag.scopeId = 'local';
+    bag.meta = { server_id: 'server-a' };
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    getPluginPanelDocument
+      .mockResolvedValueOnce({ html: '<p>v1</p>', url: 'http://grant-a.kiki-document.localhost:1234/plugin-panel/a' })
+      .mockResolvedValueOnce({ html: '<p>v1</p>', url: 'http://grant-a2.kiki-document.localhost:1234/plugin-panel/a2' })
+      .mockResolvedValueOnce({ html: '<p>v1</p>', url: 'http://grant-b.kiki-document.localhost:5678/plugin-panel/b' });
+
+    const container = window.document.createElement('div');
+    window.document.body.append(container);
+    containers.push(container);
+    const root = createRoot(container);
+    roots.push(root);
+    const render = () =>
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <PluginPanelHost pluginId="plugin-id" panelId="panel-id" />
+        </QueryClientProvider>,
+      );
+
+    await act(async () => {
+      render();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    for (let attempt = 0; attempt < 12 && container.querySelector('iframe') === null; attempt += 1) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    }
+    expect(container.querySelector('iframe')?.getAttribute('src')).toBe('http://grant-a.kiki-document.localhost:1234/plugin-panel/a');
+
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['plugin-panel-document'] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.querySelector('iframe')?.getAttribute('src')).toBe('http://grant-a.kiki-document.localhost:1234/plugin-panel/a');
+
+    bag.meta = { server_id: 'server-b' };
+    if (changeEndpoint) bag.client.baseUrl = 'https://new-server.example.test/root/';
+    await act(async () => { render(); });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['plugin-panel-document'] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(getPluginPanelDocument).toHaveBeenCalledTimes(3);
+    expect(container.querySelector('iframe')?.getAttribute('src')).toBe('http://grant-b.kiki-document.localhost:5678/plugin-panel/b');
+    queryClient.clear();
+    delete bag.scopeId;
+    delete bag.meta;
+  });
 });

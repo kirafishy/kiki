@@ -2309,55 +2309,58 @@ describe('Responses WebSocket v2 retirement', () => {
     } finally { transport.dispose(); }
   });
 
-  it('falls back to HTTP with current-turn headers and full native input on pre-inference origin_capability_mismatch without retrying on the same socket', async () => {
-    const turn1Meta = JSON.stringify({ session_id: 's1', thread_id: 't1', installation_id: 'i1', window_id: 'w1', turn_id: 'turn_1' });
-    const turn2Meta = JSON.stringify({ session_id: 's1', thread_id: 't1', installation_id: 'i1', window_id: 'w1', turn_id: 'turn_2' });
-    const gateway = await createGateway((_body, socket) => {
-      if (gateway.frames.length === 1) {
-        sendCompleted(socket, 'resp_1', 'first answer');
-        return;
-      }
-      socket.send(JSON.stringify({
-        type: 'error',
-        status: 503,
-        error: {
-          type: 'invalid_request_error',
-          code: 'origin_capability_mismatch',
-          message: 'Origin does not support per-frame Codex turn metadata.',
-          param: '',
-        },
-        execution: 'not_executed',
-      }));
-    }, v2Capabilities({ codex_turn_metadata_per_frame: true }));
-    const transport = new ResponsesWebSocketTransport();
-    try {
-      const provider = productionProvider(gateway.baseUrl);
-      const history: Message[] = [user('turn 1')];
-      const first = await generate(provider, 'instructions', [], history, undefined, {
-        responsesTransport: transport,
-        headers: { 'x-codex-turn-metadata': turn1Meta },
-        requestIdentity: { responsesClientMetadata: { 'x-codex-turn-metadata': turn1Meta, turn_id: 'turn_1' } },
-      });
-      history.push(first.message, user('turn 2'));
-      const second = await generate(provider, 'instructions', [], history, undefined, {
-        responsesTransport: transport,
-        headers: { 'x-codex-turn-metadata': turn2Meta },
-        requestIdentity: { responsesClientMetadata: { 'x-codex-turn-metadata': turn2Meta, turn_id: 'turn_2' } },
-      });
-      expect(second.message.content).toEqual([{ type: 'text', text: 'HTTP fallback' }]);
-      expect(gateway.connections).toHaveLength(1);
-      expect(gateway.frames).toHaveLength(2);
-      expect(gateway.httpRequests).toHaveLength(1);
-      expect(gateway.httpHeaders[0]?.['x-codex-turn-metadata']).toBe(turn2Meta);
-      expect((gateway.httpRequests[0]?.['client_metadata'] as RawObject)?.['x-codex-turn-metadata']).toBe(turn2Meta);
-      expect(gateway.httpRequests[0]?.['previous_response_id']).toBeUndefined();
-      expect((gateway.httpRequests[0]?.['input'] as unknown[])?.length).toBe(3);
-      expect(transport.diagnostics()).toMatchObject({
-        transport: 'ws',
-        webSocketFallbackReason: 'origin_capability_mismatch',
-      });
-    } finally { transport.dispose(); }
-  });
+  it.each(['origin_capability_mismatch', 'origin_handshake_failed', 'websocket_capacity_exceeded'] as const)(
+    'falls back to HTTP with current-turn headers and full native input on pre-inference %s without retrying on the same socket',
+    async (errorCode) => {
+      const turn1Meta = JSON.stringify({ session_id: 's1', thread_id: 't1', installation_id: 'i1', window_id: 'w1', turn_id: 'turn_1' });
+      const turn2Meta = JSON.stringify({ session_id: 's1', thread_id: 't1', installation_id: 'i1', window_id: 'w1', turn_id: 'turn_2' });
+      const gateway = await createGateway((_body, socket) => {
+        if (gateway.frames.length === 1) {
+          sendCompleted(socket, 'resp_1', 'first answer');
+          return;
+        }
+        socket.send(JSON.stringify({
+          type: 'error',
+          status: errorCode === 'websocket_capacity_exceeded' ? 429 : 503,
+          error: {
+            type: errorCode === 'origin_capability_mismatch' ? 'invalid_request_error' : 'server_error',
+            code: errorCode,
+            message: `Pre-inference ${errorCode}`,
+            param: '',
+          },
+          execution: 'not_executed',
+        }));
+      }, v2Capabilities({ codex_turn_metadata_per_frame: true }));
+      const transport = new ResponsesWebSocketTransport();
+      try {
+        const provider = productionProvider(gateway.baseUrl);
+        const history: Message[] = [user('turn 1')];
+        const first = await generate(provider, 'instructions', [], history, undefined, {
+          responsesTransport: transport,
+          headers: { 'x-codex-turn-metadata': turn1Meta },
+          requestIdentity: { responsesClientMetadata: { 'x-codex-turn-metadata': turn1Meta, turn_id: 'turn_1' } },
+        });
+        history.push(first.message, user('turn 2'));
+        const second = await generate(provider, 'instructions', [], history, undefined, {
+          responsesTransport: transport,
+          headers: { 'x-codex-turn-metadata': turn2Meta },
+          requestIdentity: { responsesClientMetadata: { 'x-codex-turn-metadata': turn2Meta, turn_id: 'turn_2' } },
+        });
+        expect(second.message.content).toEqual([{ type: 'text', text: 'HTTP fallback' }]);
+        expect(gateway.connections).toHaveLength(1);
+        expect(gateway.frames).toHaveLength(2);
+        expect(gateway.httpRequests).toHaveLength(1);
+        expect(gateway.httpHeaders[0]?.['x-codex-turn-metadata']).toBe(turn2Meta);
+        expect((gateway.httpRequests[0]?.['client_metadata'] as RawObject)?.['x-codex-turn-metadata']).toBe(turn2Meta);
+        expect(gateway.httpRequests[0]?.['previous_response_id']).toBeUndefined();
+        expect((gateway.httpRequests[0]?.['input'] as unknown[])?.length).toBe(3);
+        expect(transport.diagnostics()).toMatchObject({
+          transport: 'ws',
+          webSocketFallbackReason: errorCode,
+        });
+      } finally { transport.dispose(); }
+    },
+  );
 
   it.each(['http_status_500', 'sse_stream_error'] as const)(
     'retains WebSocket frame bytes and fallback reason on the production provider error when HTTP fallback fails (%s)',
