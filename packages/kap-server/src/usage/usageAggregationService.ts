@@ -267,7 +267,7 @@ export class UsageAggregationService {
         this.inventoryRevision++;
         this.agentInventories.clear();
         this.sourceMetadata.clear();
-        this.progressFullRequired = true;
+        this.progressFullGeneration++;
         this.progressDirtySessions.clear();
       } else if (typeof key === 'string') {
         this.dirtySessions.set(key, this.replayEpoch);
@@ -754,8 +754,8 @@ export class UsageAggregationService {
   private async prepareReadModel(requestSignal: AbortSignal, startAt?: number): Promise<void> {
     if (this.rescan.state === 'running') return;
     if (this.core.accessor.get(IRetainedUsageService).operationWritesPending) this.modelReady = false;
-    if (this.modelReady && (startAt ?? -Infinity) >= this.modelRangeStart && this.sourceChanges?.ready && this.now() - this.modelVerifiedAt < SOURCE_RECHECK_MS) return;
     this.discoverImportProgress();
+    if (this.modelReady && (startAt ?? -Infinity) >= this.modelRangeStart && this.sourceChanges?.ready && this.now() - this.modelVerifiedAt < SOURCE_RECHECK_MS) return;
     if (this.preparationController?.signal.aborted) await this.modelPreparing?.catch(() => undefined);
     if (this.modelPreparing === undefined) this.preparationController = new AbortController();
     const slice = new AbortController();
@@ -797,7 +797,8 @@ export class UsageAggregationService {
   private readonly canonicalProgress = new Map<string, { identity: string; startOffset: number; readBytes: number; totalBytes: number }>();
   private progressInventory?: Promise<void>;
   private progressInventoryReady = false;
-  private progressFullRequired = true;
+  private progressFullGeneration = 1;
+  private progressCompletedGeneration = 0;
   private readonly progressDirtySessions = new Set<string>();
   private progressRowsBySession = new Map<string, readonly { summary: SessionSummary; metadata: UsageSourceMetadata; journalSize: number }[]>();
   private progressRows: readonly { summary: SessionSummary; metadata: UsageSourceMetadata; journalSize: number }[] = [];
@@ -828,10 +829,12 @@ export class UsageAggregationService {
 
   private discoverImportProgress(): void {
     if (this.progressInventoryReady || this.progressInventory !== undefined) return;
-    const epoch = this.replayEpoch;
+    const generation = this.progressFullGeneration;
     const signal = this.modelController.signal;
-    const fullScan = this.progressFullRequired || this.progressRowsBySession.size === 0 || !this.sourceChanges?.ready;
-    const dirtySnapshot = fullScan ? [] : [...this.progressDirtySessions];
+    const fullScan = this.progressCompletedGeneration !== generation || !this.sourceChanges?.ready;
+    const dirtySnapshot = [...this.progressDirtySessions];
+    const versions = new Map(this.sessionVersions);
+    const unchanged = (key: string): boolean => versions.get(key) === this.sessionVersions.get(key);
     const work = (async () => {
       const index = this.core.accessor.get(ISessionIndex), model = this.core.accessor.get(IUsageReadModel), facts = this.core.accessor.get(IUsageFactStore);
       const collectSessionRows = async (summary: SessionSummary): Promise<{ summary: SessionSummary; metadata: UsageSourceMetadata; journalSize: number }[]> => {
@@ -851,14 +854,12 @@ export class UsageAggregationService {
       };
       if (fullScan) {
         const bySession = new Map<string, readonly { summary: SessionSummary; metadata: UsageSourceMetadata; journalSize: number }[]>();
-        const rows: { summary: SessionSummary; metadata: UsageSourceMetadata; journalSize: number }[] = [];
         let before: string | undefined;
         do {
           const page = await waitForSource(index.listRecent({ includeArchived: true, limit: INDEX_PAGE_SIZE, before }), signal);
           for (const summary of page.items) {
-            const sessionRows = await collectSessionRows(summary);
-            bySession.set(sessionKey(summary), sessionRows);
-            rows.push(...sessionRows);
+            const key = sessionKey(summary);
+            bySession.set(key, unchanged(key) ? await collectSessionRows(summary) : []);
           }
           before = page.nextCursor;
         } while (before !== undefined);
@@ -869,12 +870,19 @@ export class UsageAggregationService {
           const checkpoint = head.checkpoint;
           if (metadata !== undefined && checkpoint?.valid && head.pendingCheckpoint === undefined && checkpoint.generation === metadata.generation && checkpoint.offset === metadata.size && checkpoint.size === metadata.size && checkpoint.mtimeMs === metadata.mtimeMs) this.verifiedSources.set(source, sourceIdentity(metadata));
         }
-        if (epoch === this.replayEpoch) {
+        if (generation === this.progressFullGeneration) {
+          for (const key of this.progressDirtySessions) {
+            if (unchanged(key)) this.progressDirtySessions.delete(key);
+            else {
+              const prior = this.progressRowsBySession.get(key);
+              if (prior === undefined) bySession.delete(key);
+              else bySession.set(key, prior);
+            }
+          }
           this.progressRowsBySession = bySession;
-          this.progressDirtySessions.clear();
-          this.progressFullRequired = false;
-          this.progressRows = rows;
-          this.progressInventoryReady = true;
+          this.progressCompletedGeneration = generation;
+          this.progressRows = [...bySession.values()].flat();
+          this.progressInventoryReady = this.progressDirtySessions.size === 0;
         }
         return;
       }
@@ -885,12 +893,9 @@ export class UsageAggregationService {
         const workspaceId = sep >= 0 ? key.slice(0, sep) : undefined;
         const sessionId = sep >= 0 ? key.slice(sep + 1) : key;
         const summary = await waitForSource(index.get(sessionId, workspaceId), signal);
-        if (summary === undefined || summary.private === true) {
-          nextBySession.delete(key);
-          continue;
-        }
-        const sessionRows = await collectSessionRows(summary);
-        nextBySession.set(sessionKey(summary), sessionRows);
+        const sessionRows = summary === undefined || !unchanged(key) ? [] : await collectSessionRows(summary);
+        if (summary === undefined || summary.private === true) nextBySession.delete(key);
+        else nextBySession.set(key, sessionRows);
         for (const row of sessionRows) refreshedSources.push(row.metadata);
       }
       this.retainedProgress = await this.core.accessor.get(IRetainedUsageService).readModelImportProgress?.(signal) ?? [];
@@ -904,15 +909,22 @@ export class UsageAggregationService {
           }
         }
       }
-      if (epoch === this.replayEpoch) {
+      if (generation === this.progressFullGeneration) {
+        for (const key of dirtySnapshot) {
+          if (unchanged(key)) this.progressDirtySessions.delete(key);
+          else {
+            const prior = this.progressRowsBySession.get(key);
+            if (prior === undefined) nextBySession.delete(key);
+            else nextBySession.set(key, prior);
+          }
+        }
         this.progressRowsBySession = nextBySession;
-        for (const key of dirtySnapshot) this.progressDirtySessions.delete(key);
         this.progressRows = [...nextBySession.values()].flat();
-        this.progressInventoryReady = this.progressDirtySessions.size === 0 && !this.progressFullRequired;
+        this.progressInventoryReady = this.progressDirtySessions.size === 0;
       }
-    })();
+    })().finally(() => { if (this.progressInventory === work) this.progressInventory = undefined; });
     this.progressInventory = work;
-    void work.catch((error: unknown) => { if (!signal.aborted) this.core.accessor.get(ILogService).warn('Usage import progress inventory pending', error); }).finally(() => { if (this.progressInventory === work) this.progressInventory = undefined; });
+    void work.catch((error: unknown) => { if (!signal.aborted) this.core.accessor.get(ILogService).warn('Usage import progress inventory pending', error); });
   }
 
   private importProgress(query: NormalizedQuery): UsageResponse['reliability']['import_progress'] {
@@ -953,7 +965,7 @@ export class UsageAggregationService {
         const verifyAll = full || this.verifiedInventoryRevision !== this.inventoryRevision || !this.sourceChanges?.ready || this.now() - this.modelVerifiedAt >= SOURCE_RECHECK_MS || rangeStart < this.modelRangeStart;
         const heads = new Map(verifyAll ? (await waitForSource(model.sources(signal), signal)).map((row) => [row.source, row.head]) : []);
         if (verifyAll) {
-          if (full || this.verifiedInventoryRevision >= 0 && (!this.sourceChanges?.ready || this.now() - this.modelVerifiedAt >= SOURCE_RECHECK_MS)) { this.agentInventories.clear(); this.sourceMetadata.clear(); this.progressFullRequired = true; this.progressDirtySessions.clear(); this.progressInventoryReady = false; }
+          if (full || this.verifiedInventoryRevision >= 0 && (!this.sourceChanges?.ready || this.now() - this.modelVerifiedAt >= SOURCE_RECHECK_MS)) { this.agentInventories.clear(); this.sourceMetadata.clear(); this.progressFullGeneration++; this.progressDirtySessions.clear(); this.progressInventoryReady = false; }
           this.modelExcludedSources.clear();
           this.modelRangeStart = rangeStart;
         }

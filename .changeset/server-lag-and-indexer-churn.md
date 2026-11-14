@@ -2,4 +2,4 @@
 "@kiki/cli": patch
 ---
 
-Fix server stalls and background CPU churn in workspaces with large session histories.
+Fix server stalls, delayed search and usage updates, and workspace file ignore reloads.

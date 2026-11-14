@@ -410,6 +410,27 @@ describe('host filesystem change notifications', () => {
     expect(events.some((e) => e.path.includes('/.git/') || e.path.endsWith('/.git'))).toBe(false);
   });
 
+  it('passes directory stats to the ignore predicate before crawling directory contents', async () => {
+    root = await mkdtemp(join(tmpdir(), 'hostfswatch-'));
+    const ignoredDir = join(root, 'dist');
+    const hiddenFile = join(ignoredDir, 'hidden.txt');
+    await mkdir(ignoredDir);
+    await writeFile(hiddenFile, 'hidden');
+    let directoryChecked = false;
+    let childChecked = false;
+    handle = new HostFsWatchService().watch(root, {
+      recursive: true,
+      ignored: (path, stats) => {
+        if (path.replaceAll('\\', '/') === hiddenFile.replaceAll('\\', '/')) childChecked = true;
+        if (path.replaceAll('\\', '/') === ignoredDir.replaceAll('\\', '/') && stats?.isDirectory()) { directoryChecked = true; return true; }
+        return false;
+      },
+    });
+    await handle.ready;
+    expect(directoryChecked).toBe(true);
+    expect(childChecked).toBe(false);
+  });
+
   it('does not fire for pre-existing files (ignoreInitial)', async () => {
     root = await mkdtemp(join(tmpdir(), 'hostfswatch-'));
     const preexisting = join(root, 'pre.txt');

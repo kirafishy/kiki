@@ -2500,6 +2500,91 @@ describe('SQLite Usage history source lifecycle', () => {
     resumed.dispose();
   });
 
+  it('publishes unchanged census rows during a wire append and revisits only the changed session', async () => {
+    const changes = new Emitter<UsageSourceChange>();
+    const f = fixture([summary('stable', 'w'), summary('stream', 'w')], {}, Date.now, {}, undefined, undefined, undefined, undefined, undefined,
+      { ready: true, onDidChange: changes.event });
+    const index = f.core.accessor.get(ISessionIndex);
+    const listRecent = vi.spyOn(index, 'listRecent');
+    const getSession = vi.spyOn(index, 'get');
+    let enter!: () => void, unblock!: () => void;
+    const reached = new Promise<void>((resolve) => { enter = resolve; });
+    const release = new Promise<void>((resolve) => { unblock = resolve; });
+    const facts = f.facts.journalSize.bind(f.facts);
+    vi.spyOn(f.facts, 'journalSize').mockImplementation(async (source, signal) => {
+      if (source === scope('w', 'stream')) { enter(); await release; }
+      return facts(source, signal);
+    });
+    try {
+      f.service['discoverImportProgress']();
+      await reached;
+      f.setWire(scope('w', 'stream'), [usageRecord(2)]);
+      changes.fire({ kind: 'agent', sessionKey: 'w\0stream', agentId: 'main' });
+      unblock();
+      await f.service['progressInventory'];
+      expect(f.service['progressRows'].map((row) => row.summary.id)).toEqual(['stable']);
+      expect(f.service['progressInventoryReady']).toBe(false);
+      f.service['discoverImportProgress']();
+      await f.service['progressInventory'];
+      expect(f.service['progressRows'].map((row) => row.summary.id)).toEqual(['stable', 'stream']);
+      expect(f.service['progressInventoryReady']).toBe(true);
+      expect(listRecent).toHaveBeenCalledTimes(1);
+      expect(getSession.mock.calls.map(([id]) => id)).toEqual(['stream']);
+
+      const prior = f.service['progressRowsBySession'].get('w\0stream');
+      const nextEntered = new Promise<void>((resolve) => { enter = resolve; });
+      const nextRelease = new Promise<void>((resolve) => { unblock = resolve; });
+      vi.spyOn(f.facts, 'journalSize').mockImplementation(async (source, signal) => {
+        if (source === scope('w', 'stream')) { enter(); await nextRelease; }
+        return facts(source, signal);
+      });
+      changes.fire({ kind: 'agent', sessionKey: 'w\0stable', agentId: 'main' });
+      changes.fire({ kind: 'agent', sessionKey: 'w\0stream', agentId: 'main' });
+      f.service['discoverImportProgress']();
+      await nextEntered;
+      f.setWire(scope('w', 'stream'), [usageRecord(2), usageRecord(3)]);
+      changes.fire({ kind: 'agent', sessionKey: 'w\0stream', agentId: 'main' });
+      unblock();
+      await f.service['progressInventory'];
+      expect(f.service['progressRowsBySession'].get('w\0stream')).toBe(prior);
+      expect(f.service['progressDirtySessions']).toEqual(new Set(['w\0stream']));
+      f.service['discoverImportProgress']();
+      await f.service['progressInventory'];
+      expect(f.service['progressRowsBySession'].get('w\0stream')).not.toBe(prior);
+      expect(f.service['progressInventoryReady']).toBe(true);
+      expect(listRecent).toHaveBeenCalledTimes(1);
+    } finally { unblock(); await f.service['progressInventory']; f.service.dispose(); changes.dispose(); }
+  });
+
+  it('keeps a newer full census request when the older census finishes', async () => {
+    const changes = new Emitter<UsageSourceChange>();
+    const f = fixture([summary('s', 'w')], {}, Date.now, {}, undefined, undefined, undefined, undefined, undefined,
+      { ready: true, onDidChange: changes.event });
+    let enter!: () => void, unblock!: () => void;
+    const reached = new Promise<void>((resolve) => { enter = resolve; });
+    const release = new Promise<void>((resolve) => { unblock = resolve; });
+    const original = f.facts.journalSize.bind(f.facts);
+    vi.spyOn(f.facts, 'journalSize').mockImplementationOnce(async (source, signal) => {
+      enter();
+      await release;
+      return original(source, signal);
+    });
+    try {
+      f.service['discoverImportProgress']();
+      await reached;
+      f.service.startFullRescan();
+      await expect.poll(() => f.service.rescanStatus().state).toBe('completed');
+      unblock();
+      await f.service['progressInventory'];
+      expect(f.service['progressInventoryReady']).toBe(false);
+      const listRecent = vi.spyOn(f.core.accessor.get(ISessionIndex), 'listRecent');
+      await query(f.service);
+      await f.service['progressInventory'];
+      expect(listRecent).toHaveBeenCalledTimes(1);
+      expect(f.service['progressInventoryReady']).toBe(true);
+    } finally { unblock(); await f.service['progressInventory']; f.service.dispose(); changes.dispose(); }
+  });
+
   it('invalidates only the changed agent metadata and refreshes import progress incrementally on agent updates', async () => {
     const changes = new Emitter<UsageSourceChange>();
     const s1 = summary('s1', 'w');

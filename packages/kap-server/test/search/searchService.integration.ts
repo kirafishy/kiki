@@ -1198,7 +1198,7 @@ describe('GlobalSearchService', () => {
       status: () => ({ source: 'authoritative', state: 'ready', degradedCount: 0 }),
       listRecent: async () => ({ items: [...records.values()], nextCursor: undefined }),
       get: async (id: string) => deferGets
-        ? await new Promise<SessionSummary | undefined>((resolve) => { pendingGets.push(resolve); })
+        ? new Promise<SessionSummary | undefined>((resolve) => { pendingGets.push(resolve); })
         : records.get(id),
       archiveFamily: async () => [],
       count: async () => records.size,
@@ -1269,6 +1269,53 @@ describe('GlobalSearchService', () => {
           score: h.score,
         }));
       expect(project(live)).toEqual(project(index));
+    });
+
+    it('retains a dirty on-disk session until publication and indexes its first public summary immediately', { timeout: 30_000 }, async () => {
+      const s1 = summary('s1', 'existing', T1);
+      const created = summary('s2', 'new', T2);
+      const indexed = [s1];
+      const index = gettableIndex(indexed);
+      const changes = new Emitter<SessionIndexMutation>();
+      const mirror = { onDidChange: changes.event } as ISessionIndexMirror;
+      await writeWire(home!, s1.id, 'main', [userLine('existing wire', T1)]);
+      const service = track(makeService(home!, index, mirror));
+      await service.reindex();
+      const watcher = service['sourceWatcher']!;
+      watcher.close();
+      await writeWire(home!, created.id, 'main', [userLine('newly visible wire', T2)]);
+      const dirty = service['dirtySessions'];
+      dirty.set(created.id, { workspaceId: WS });
+      await service['ensureSyncStarted']();
+      expect(dirty.has(created.id)).toBe(true);
+      expect(service['sqliteHost'].snapshot().indexedSessions).toBe(1);
+
+      service.syncDebounceMs = 60_000;
+      let enter!: () => void, release!: () => void;
+      const entered = new Promise<void>((resolve) => { enter = resolve; });
+      const blocked = new Promise<void>((resolve) => { release = resolve; });
+      const listRecent = index.listRecent.bind(index);
+      index.listRecent = async (query) => {
+        const page = await listRecent(query);
+        const items = [...page.items];
+        enter();
+        await blocked;
+        return { ...page, items };
+      };
+      service['inventoryDirty'] = true;
+      const syncing = service['ensureSyncStarted']();
+      await entered;
+      try {
+        indexed.push(created);
+        index.get = async (id) => indexed.find((row) => row.id === id);
+        changes.fire({ id: created.id, workspaceId: WS });
+        await expect.poll(() => service['allSummaries'].has(created.id)).toBe(true);
+        await expect.poll(() => service['sqliteHost'].snapshot().indexedSessions, { timeout: 10_000 }).toBe(2);
+      } finally { release(); await syncing; }
+      await expect.poll(() => service['sqliteHost'].snapshot().state, { timeout: 10_000 }).toBe('ready');
+      expect(service['allSummaries'].has(created.id)).toBe(true);
+      expect((await service.search({ query: 'newly visible wire', mode: 'literal', indexOnly: true })).items).toHaveLength(1);
+      changes.dispose();
     });
 
     it('uses targeted syncSession on incremental main updates and ignores subagent or checkpoint watch noise', { timeout: 30_000 }, async () => {

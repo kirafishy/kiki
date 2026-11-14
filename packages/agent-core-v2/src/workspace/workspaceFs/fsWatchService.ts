@@ -7,6 +7,7 @@ import { isPromiseLike } from '#/_base/lifecycle/disposer';
 import { onUnexpectedError } from '#/_base/errors/unexpectedError';
 import { Emitter, type Event } from '#/_base/event';
 import { IHostFileSystem } from '#/os/interface/hostFileSystem';
+import { OsFsErrors } from '#/os/interface/hostFsErrors';
 import {
   type HostFsChange,
   type IHostFsWatchHandle,
@@ -39,8 +40,11 @@ export class WorkspaceFsWatchService extends Disposable implements IWorkspaceFsW
   private readonly subscriptions = new Set<WorkspaceFsWatchSubscription>();
   private handle: IHostFsWatchHandle | undefined;
   private handleSub: IDisposable | undefined;
-  private gitignoreLoaded = false;
-  private readonly matcher: Ignore = ignore().add('.git/');
+  private gitignoreContent: string | undefined;
+  private matcher: Ignore = ignore().add('.git/');
+  private refreshRequested = false;
+  private refreshFlight: Promise<void> | undefined;
+  private disposed = false;
   private readonly workDir: string;
 
   constructor(
@@ -71,7 +75,7 @@ export class WorkspaceFsWatchService extends Disposable implements IWorkspaceFsW
   syncHandle(): void {
     for (const sub of this.subscriptions) {
       if (sub.hasPaths()) {
-        this.ensureHandle();
+        if (this.handle === undefined) void this.refreshHandle().catch(onUnexpectedError);
         return;
       }
     }
@@ -83,22 +87,40 @@ export class WorkspaceFsWatchService extends Disposable implements IWorkspaceFsW
     this.syncHandle();
   }
 
-  private ensureHandle(): void {
-    if (this.handle !== undefined) return;
-    this.loadGitignore();
-    const handle = this.hostFsWatch.watch(this.workDir, {
-      recursive: true,
-      ignored: (candidate) => {
-        const rel = this.toRel(candidate);
-        return (
-          rel !== '.' &&
-          !rel.startsWith('..') &&
-          (rel === '.git' || rel.startsWith('.git/') || this.matcher.ignores(rel))
-        );
-      },
-    });
-    this.handle = handle;
-    this.handleSub = handle.onDidChange((e) => this.onRaw(e));
+  private refreshHandle(): Promise<void> {
+    this.refreshRequested = true;
+    if (this.refreshFlight !== undefined) return this.refreshFlight;
+    const work = (async () => {
+      while (this.refreshRequested && !this.disposed) {
+        this.refreshRequested = false;
+        const content = await this.hostFs.readText(join(this.workDir, '.gitignore')).catch((error: unknown) => {
+          if (error instanceof Error && 'code' in error && error.code === OsFsErrors.codes.OS_FS_NOT_FOUND) return '';
+          throw error;
+        });
+        if (this.disposed || ![...this.subscriptions].some((sub) => sub.hasPaths())) return;
+        if (this.handle !== undefined && content === this.gitignoreContent) continue;
+        this.gitignoreContent = content;
+        this.matcher = ignore().add('.git/').add(content);
+        this.teardownHandle();
+        const handle = this.hostFsWatch.watch(this.workDir, {
+          recursive: true,
+          ignored: (candidate, stats) => {
+            const rel = this.toRel(candidate);
+            return rel !== '.' && rel !== '.gitignore' && !rel.startsWith('..') && (
+              rel === '.git' || rel.startsWith('.git/') || this.matcher.ignores(rel) ||
+              stats?.isDirectory() === true && this.matcher.ignores(`${rel}/`)
+            );
+          },
+        });
+        this.handle = handle;
+        this.handleSub = handle.onDidChange((e) => this.onRaw(e));
+        void handle.ready.then(() => {
+          if (this.handle === handle) return this.refreshHandle();
+        }).catch(onUnexpectedError);
+      }
+    })().finally(() => { if (this.refreshFlight === work) this.refreshFlight = undefined; });
+    this.refreshFlight = work;
+    return work;
   }
 
   private teardownHandle(): void {
@@ -110,20 +132,10 @@ export class WorkspaceFsWatchService extends Disposable implements IWorkspaceFsW
     this.handle = undefined;
   }
 
-  private loadGitignore(): void {
-    if (this.gitignoreLoaded) return;
-    this.gitignoreLoaded = true;
-    void this.hostFs.readText(join(this.workDir, '.gitignore')).then(
-      (content) => {
-        this.matcher.add(content);
-      },
-      () => undefined,
-    );
-  }
-
   private onRaw(e: HostFsChange): void {
     const rel = this.toRel(e.path);
     if (rel === '.') return;
+    if (rel === '.gitignore') void this.refreshHandle().catch(onUnexpectedError);
     const probe = e.kind === 'directory' ? `${rel}/` : rel;
     if (this.matcher.ignores(probe)) return;
     for (const sub of this.subscriptions) {
@@ -132,6 +144,7 @@ export class WorkspaceFsWatchService extends Disposable implements IWorkspaceFsW
   }
 
   override async dispose(): Promise<void> {
+    this.disposed = true;
     for (const sub of this.subscriptions) {
       sub.dispose();
     }

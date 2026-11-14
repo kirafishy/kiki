@@ -53,8 +53,10 @@ export class UsageFactStore extends Disposable implements IUsageFactStore {
   declare readonly _serviceBrand: undefined;
   private readonly operations = new Map<string, Promise<unknown>>();
   private readonly damaged = new Set<string>();
-  private readonly privacyCache = new Map<string, { fingerprint: string; value: boolean }>();
-  private readonly privacyFlights = new Map<string, Promise<boolean>>();
+  private privacyEpoch = 0;
+  private readonly privateSessions = new Set<string>();
+  private readonly privacyCache = new Map<string, { fingerprint: string; epoch: number; value: boolean }>();
+  private readonly privacyFlights = new Map<string, { fingerprint: string; epoch: number; result: Promise<boolean | undefined> }>();
   constructor(
     @IAppendLogStore private readonly logs: IAppendLogStore,
     @IFileSystemStorageService private readonly storage: IFileSystemStorageService,
@@ -92,12 +94,13 @@ export class UsageFactStore extends Disposable implements IUsageFactStore {
     while (this.operations.size > 0) await Promise.allSettled(this.operations.values());
     this.privacyCache.clear();
     this.privacyFlights.clear();
+    this.privateSessions.clear();
   }
   async setSessionPrivacy(summary: SessionSummary): Promise<void> {
-    const suffix = `/${summary.workspaceId}/${summary.id}`;
-    for (const key of this.privacyCache.keys()) {
-      if (key.endsWith(suffix)) this.privacyCache.delete(key);
-    }
+    this.privacyEpoch++;
+    const key = `${summary.workspaceId}/${summary.id}`;
+    if (summary.private === true) this.privateSessions.add(key);
+    else this.privateSessions.delete(key);
     await this.model.setSessionPrivacy(summary.workspaceId, summary.id, summary.private === true);
   }
   private async stateFingerprint(session: string): Promise<string | undefined> {
@@ -114,27 +117,35 @@ export class UsageFactStore extends Disposable implements IUsageFactStore {
   private async isPrivate(scope: string): Promise<boolean> {
     const index = scope.lastIndexOf('/agents/');
     const session = index >= 0 ? scope.slice(0, index) : scope;
-    const fingerprint = await this.stateFingerprint(session);
-    if (fingerprint === undefined) {
-      this.privacyCache.delete(session);
-      return false;
+    const key = session.split('/').slice(-2).join('/');
+    while (true) {
+      if (this.privateSessions.has(key)) return true;
+      const epoch = this.privacyEpoch;
+      const fingerprint = await this.stateFingerprint(session);
+      if (epoch !== this.privacyEpoch) continue;
+      if (fingerprint === undefined) {
+        this.privacyCache.delete(session);
+        return false;
+      }
+      const cached = this.privacyCache.get(session);
+      if (cached?.fingerprint === fingerprint && cached.epoch === epoch) return cached.value;
+      let flight = this.privacyFlights.get(session);
+      if (flight?.fingerprint !== fingerprint || flight.epoch !== epoch) {
+        const result = (async () => {
+          const value = (await this.documents.get<SessionMeta>(session, 'state.json'))?.private === true;
+          const after = await this.stateFingerprint(session);
+          if (after !== fingerprint || epoch !== this.privacyEpoch) return undefined;
+          this.privacyCache.set(session, { fingerprint, epoch, value });
+          return value;
+        })().finally(() => {
+          if (this.privacyFlights.get(session)?.result === result) this.privacyFlights.delete(session);
+        });
+        flight = { fingerprint, epoch, result };
+        this.privacyFlights.set(session, flight);
+      }
+      const value = await flight.result;
+      if (value !== undefined && epoch === this.privacyEpoch) return value;
     }
-    const cached = this.privacyCache.get(session);
-    if (cached?.fingerprint === fingerprint) return cached.value;
-    let flight = this.privacyFlights.get(session);
-    if (flight === undefined) {
-      flight = (async () => {
-        const value = (await this.documents.get<SessionMeta>(session, 'state.json'))?.private === true;
-        const after = await this.stateFingerprint(session);
-        if (after === fingerprint) this.privacyCache.set(session, { fingerprint, value });
-        else this.privacyCache.delete(session);
-        return value;
-      })().finally(() => {
-        if (this.privacyFlights.get(session) === flight) this.privacyFlights.delete(session);
-      });
-      this.privacyFlights.set(session, flight);
-    }
-    return flight;
   }
   private async commitWritten(position: AppendLogCommit, records: readonly UsageFact[], valid: boolean): Promise<void> {
     const mtimeMs = await this.storage.mtime(position.scope, position.key) ?? 0;

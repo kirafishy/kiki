@@ -79,6 +79,38 @@ describe('UsageFactStore', () => {
     await expect(facts.summary(SCOPE)).resolves.toEqual({});
   });
 
+  it.each(['fingerprint', 'epoch'] as const)('rechecks a blocked public privacy flight after a %s change before publishing usage', async (change) => {
+    const documents = ix.get(IAtomicDocumentStore);
+    const sessionScope = 'sessions/example/session';
+    await documents.set(sessionScope, 'state.json', { id: 'session', private: false, agents: {} });
+    let release!: () => void, enter!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    const get = documents.get.bind(documents);
+    vi.spyOn(documents, 'get').mockImplementationOnce(async <T>(scope: string, key: string) => {
+      const value = await get<T>(scope, key);
+      enter();
+      await blocked;
+      return value;
+    });
+    const first = facts.commit(SCOPE, 0, checkpoint(1), [normalizeUsageFact(fact(), 'main')!]);
+    await entered;
+    const other = `${sessionScope}/agents/other`;
+    try {
+      if (change === 'fingerprint') await documents.set(sessionScope, 'state.json', { id: 'session', private: true, agents: {} });
+      else await facts.setSessionPrivacy({ ...session, private: true });
+      const second = facts.commit(other, 0, checkpoint(1), [normalizeUsageFact(fact(), 'other')!]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      release();
+      await Promise.all([first, second]);
+      for (const source of [SCOPE, other]) {
+        const directory = `cache/usage-facts-v1/${createHash('sha256').update(source).digest('hex')}`;
+        expect(await storage.size(directory, 'facts.jsonl')).toBeUndefined();
+        expect((await model.summary(source)).totals).toBeUndefined();
+      }
+    } finally { release(); await first; }
+  });
+
   it('hides SQL totals through privacy cataloging and restores them when privacy is cleared', async () => {
     logs.append(SCOPE, KEY, fact());
     await logs.flush();
