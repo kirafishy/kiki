@@ -1282,7 +1282,7 @@ describe('Sidebar entry distribution', () => {
     const nav = container.querySelector('[data-primary-nav]');
     expect(nav?.getAttribute('aria-label')).toBe('Workspace tools');
     const labels = [...(nav?.querySelectorAll('button') ?? [])].map((button) => button.children[1]?.textContent);
-    expect(labels).toEqual(['Memory', 'Personas', 'Usage', 'More tools']);
+    expect(labels).toEqual(['Memory', 'Personas', 'Activity', 'More tools']);
     expect(nav?.querySelector('[data-nav-personas]')).not.toBeNull();
     expect(nav?.querySelector('[data-nav-usage]')).not.toBeNull();
     // Memory is permanent, on or off: switched off the page is the turn-on guide.
@@ -1304,7 +1304,7 @@ describe('Sidebar entry distribution', () => {
     expect(nav?.querySelector('[data-nav-capabilities]')).not.toBeNull();
 
     await settle();
-    expect(nav?.querySelector('[data-request-governance-badge]')?.textContent).toBe('2 queued');
+    expect(nav?.querySelector('[data-request-governance-badge]')?.textContent).toBe('3 · +2');
   });
 
   it('places connection state on the top position bar and never renders a footer connection mark', async () => {
@@ -3458,7 +3458,7 @@ describe('sidebar on a phone', () => {
 
     const open = await mount({ ...props, inert: false });
     for (let index = 0; index < 3; index += 1) await settle();
-    expect(open.container.querySelector('[data-request-governance-badge]')?.textContent).toBe('2 queued');
+    expect(open.container.querySelector('[data-request-governance-badge]')?.textContent).toBe('3 · +2');
     expect(listEphemeralSessions).toHaveBeenCalled();
     expect(listPrompts).toHaveBeenCalledWith('s-busy', { observe: true });
     expect(listTasks).toHaveBeenCalled();

@@ -35,17 +35,23 @@ import { AxisGroup, UsageSectionHeading } from './usage/usageShared';
 export const CONCURRENCY_RULES_SETTINGS_HREF = '/settings/ai?tab=defaults#st-card-concurrency';
 
 /**
- * The sidebar's Usage badge. Running requests need nothing from the reader
- * (the conversation rows already show what is running), so the badge speaks
- * only when something waits: "1 queued" in quiet ink. A stale read keeps the
- * last queued count with a hollow mark rather than claiming it is current.
+ * The sidebar's Activity badge: live active and queued model request counts in
+ * quiet tabular figures (`3`, `3 · +1`, `+1`) while work is running or waiting,
+ * and silent when idle. A stale read keeps the last non-idle counts with a
+ * hollow mark (`◦`) rather than claiming they are current.
  */
 export function RequestGovernanceBadge({ compact = false }: { compact?: boolean }) {
   const { snapshot, stale } = useRequestGovernance();
   const { t } = useI18n();
-  if (snapshot === undefined || snapshot.queued === 0) return null;
-  const queuedText = t('nav.usage.queued', { count: snapshot.queued });
-  const title = `${queuedText}${stale ? ` · ${t('usage.governance.stale', { time: snapshot.asOf })}` : ''}`;
+  if (snapshot === undefined || (snapshot.active === 0 && snapshot.queued === 0)) return null;
+  const title = `${t('usage.governance.badge', { active: snapshot.active, queued: snapshot.queued })}${stale ? ` · ${t('usage.governance.stale', { time: snapshot.asOf })}` : ''}`;
+  const label = compact
+    ? (snapshot.active > 0 ? String(snapshot.active) : `+${snapshot.queued}`)
+    : snapshot.active > 0 && snapshot.queued > 0
+      ? `${snapshot.active} · +${snapshot.queued}`
+      : snapshot.active > 0
+        ? String(snapshot.active)
+        : `+${snapshot.queued}`;
   return (
     <span
       data-request-governance-badge
@@ -54,9 +60,9 @@ export function RequestGovernanceBadge({ compact = false }: { compact?: boolean 
       aria-label={title}
       className={compact
         ? 'absolute -right-2 -bottom-1 rounded bg-paper px-0.5 font-mono text-[9px] leading-3 text-ink-faint tabular-nums'
-        : 'ml-auto shrink-0 text-[11px] text-ink-faint tabular-nums'}
+        : 'ml-auto shrink-0 font-mono text-[11px] text-ink-faint tabular-nums'}
     >
-      {compact ? snapshot.queued : queuedText}
+      {label}
       {!compact && stale ? ' ◦' : ''}
     </span>
   );

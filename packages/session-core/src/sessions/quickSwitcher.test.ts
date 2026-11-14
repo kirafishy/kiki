@@ -136,7 +136,12 @@ describe('buildSwitcherItems — with query', () => {
 });
 
 describe('buildSwitcherItems — page actions', () => {
-  const usageAction = { actionId: 'usage', title: 'Open usage dashboard', route: '/usage' };
+  const usageAction = {
+    actionId: 'usage',
+    title: 'Open activity and usage',
+    route: '/usage',
+    keywords: ['activity', 'usage', 'live', 'quotas', '运行', '用量'],
+  };
   const sessions = [session('s1', '2026-01-02T00:00:00.000Z')];
 
   it('pins actions above the recent sessions on an empty query', () => {
@@ -151,7 +156,7 @@ describe('buildSwitcherItems — page actions', () => {
     expect(items[1]).toMatchObject({ kind: 'session', sessionId: 's1' });
   });
 
-  it('matches actions by title substring, ahead of session matches', () => {
+  it('matches actions by title substring or keyword alias, ahead of session matches', () => {
     const items = buildSwitcherItems({
       query: 'usage',
       sessions: [session('usage-notes', '2026-01-02T00:00:00.000Z', { title: 'Usage notes' })],
@@ -160,6 +165,17 @@ describe('buildSwitcherItems — page actions', () => {
       actions: [usageAction],
     });
     expect(items.map((item) => item.kind)).toEqual(['action', 'session']);
+
+    for (const term of ['activity', 'live', '运行', '用量']) {
+      const matched = buildSwitcherItems({
+        query: term,
+        sessions,
+        hits: [],
+        untitled: 'Untitled',
+        actions: [usageAction],
+      });
+      expect(matched[0]).toMatchObject({ kind: 'action', actionId: 'usage', route: '/usage' });
+    }
   });
 
   it('drops actions whose title does not match the query', () => {

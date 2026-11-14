@@ -104,7 +104,12 @@ export function QuickSwitcher({
         untitled,
         localMatches,
         actions: [
-          { actionId: 'usage', title: usageActionTitle, route: '/usage' },
+          {
+            actionId: 'usage',
+            title: usageActionTitle,
+            route: '/usage',
+            keywords: ['activity', 'usage', 'live', 'quotas', '运行', '用量', '实时', '额度'],
+          },
           { actionId: 'cron', title: t('nav.cron'), route: '/cron' },
           { actionId: 'memory', title: t('nav.memory'), route: '/memory' },
           ...(advisorTitle === undefined ? [] : [{ actionId: ADVISOR_ACTION, title: advisorTitle, route: DECISION_JUDGES_ROUTE }]),

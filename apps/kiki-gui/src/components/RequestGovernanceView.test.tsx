@@ -69,7 +69,7 @@ function LocationProbe() {
   return <span hidden data-location={location.pathname} data-full-location={`${location.pathname}${location.search}${location.hash}`} />;
 }
 
-function mount(view: 'realtime' | 'limits', withBadge = false, seed?: (queryClient: QueryClient) => void) {
+function mount(view: 'realtime' | 'limits', withBadge: boolean | 'both' = false, seed?: (queryClient: QueryClient) => void) {
   reactActEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   seed?.(queryClient);
@@ -81,7 +81,8 @@ function mount(view: 'realtime' | 'limits', withBadge = false, seed?: (queryClie
       <QueryClientProvider client={queryClient}>
         <MemoryRouter initialEntries={[`/usage?panel=${view}`]}>
           <I18nProvider>
-            {withBadge ? <RequestGovernanceBadge /> : null}
+            {withBadge ? <div data-full-badge><RequestGovernanceBadge /></div> : null}
+            {withBadge === 'both' ? <div data-compact-badge><RequestGovernanceBadge compact /></div> : null}
             <RequestGovernanceView view={view} />
             <LocationProbe />
           </I18nProvider>
@@ -220,7 +221,12 @@ describe('live request governance', () => {
     await act(async () => { render(); await vi.advanceTimersByTimeAsync(1100); });
     expect(container.querySelector('[data-governance-active]')?.textContent).toBe('3');
     expect(container.querySelector('[data-governance-queued]')?.textContent).toBe('2');
-    expect(container.querySelector('[data-request-governance-badge]')?.textContent).toBe(locale === 'zh' ? '2 排队 ◦' : '2 queued ◦');
+    expect(container.querySelector('[data-request-governance-badge]')?.textContent).toBe('3 · +2 ◦');
+    expect(container.querySelector('[data-request-governance-badge]')?.getAttribute('aria-label')).toContain(
+      locale === 'zh'
+        ? '当前模型请求 3，等待 2 · 数据可能已过期'
+        : 'Model requests 3, waiting 2 · This view may be out of date',
+    );
     const staleLines = container.querySelectorAll('[data-governance-stale]');
     expect(staleLines).toHaveLength(1);
     expect(staleLines[0]?.textContent).toContain(locale === 'zh'
@@ -246,14 +252,19 @@ describe('live request governance', () => {
     expect(container.querySelector('[data-governance-dimensions]')?.textContent).toContain('Subagents');
   });
 
-  it('shows RequestGovernanceBadge only while something is queued', async () => {
+  it('shows RequestGovernanceBadge when active or queued and hides it when unavailable or idle', async () => {
     vi.useFakeTimers();
+    localStorage.setItem('kiki.locale', 'en');
     connection.wsStatus = 'open';
     connection.client.getRequestGovernance.mockRejectedValueOnce(new Error('unavailable'));
-    const { container, render } = mount('realtime', true);
+    const { container, render } = mount('realtime', 'both');
+    const fullBadge = () => container.querySelector('[data-full-badge] [data-request-governance-badge]');
+    const compactBadge = () => container.querySelector('[data-compact-badge] [data-request-governance-badge]');
     await settle(render);
-    expect(container.querySelector('[data-request-governance-badge]')).toBeNull();
+    expect(fullBadge()).toBeNull();
+    expect(compactBadge()).toBeNull();
 
+    // Idle 0/0 stays silent, even if a subsequent poll fails and marks it stale.
     connection.client.getRequestGovernance.mockResolvedValueOnce({
       ...snapshot,
       active: 0,
@@ -261,24 +272,46 @@ describe('live request governance', () => {
       dimensions: [],
     });
     await act(async () => { render(); await vi.advanceTimersByTimeAsync(1100); });
-    expect(container.querySelector('[data-request-governance-badge]')).toBeNull();
+    expect(fullBadge()).toBeNull();
+    expect(compactBadge()).toBeNull();
 
-    // Running alone needs nothing from the reader: no badge.
+    connection.client.getRequestGovernance.mockRejectedValueOnce(new Error('dropped'));
+    await act(async () => { render(); await vi.advanceTimersByTimeAsync(1100); });
+    expect(fullBadge()).toBeNull();
+    expect(compactBadge()).toBeNull();
+
+    // Active > 0 with queued === 0 renders the live active count.
     connection.client.getRequestGovernance.mockResolvedValueOnce({
       ...snapshot,
       active: 2,
       queued: 0,
     });
     await act(async () => { render(); await vi.advanceTimersByTimeAsync(1100); });
-    expect(container.querySelector('[data-request-governance-badge]')).toBeNull();
+    expect(fullBadge()?.textContent).toBe('2');
+    expect(compactBadge()?.textContent).toBe('2');
+    expect(fullBadge()?.getAttribute('aria-label')).toBe('Model requests 2, waiting 0');
 
+    // Active > 0 with queued > 0 renders active · +queued (and active in compact rail).
     connection.client.getRequestGovernance.mockResolvedValueOnce({
       ...snapshot,
       active: 2,
       queued: 1,
     });
     await act(async () => { render(); await vi.advanceTimersByTimeAsync(1100); });
-    expect(container.querySelector('[data-request-governance-badge]')?.textContent).toMatch(/^1 (queued|排队)$/);
+    expect(fullBadge()?.textContent).toBe('2 · +1');
+    expect(compactBadge()?.textContent).toBe('2');
+    expect(fullBadge()?.getAttribute('aria-label')).toBe('Model requests 2, waiting 1');
+
+    // Active === 0 with queued > 0 renders +queued in both full and compact.
+    connection.client.getRequestGovernance.mockResolvedValueOnce({
+      ...snapshot,
+      active: 0,
+      queued: 1,
+    });
+    await act(async () => { render(); await vi.advanceTimersByTimeAsync(1100); });
+    expect(fullBadge()?.textContent).toBe('+1');
+    expect(compactBadge()?.textContent).toBe('+1');
+    expect(fullBadge()?.getAttribute('aria-label')).toBe('Model requests 0, waiting 1');
   });
 });
 

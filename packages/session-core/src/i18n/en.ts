@@ -1541,7 +1541,7 @@ export const en = {
   'composer.queuedWaited': 'Waited: {seconds}s',
   'composer.queuedModel': 'Model: {model}',
   'composer.queuedRules': 'Blocking rules: {rules}',
-  'composer.queuedUsageLink': 'Manage limit rules in Usage',
+  'composer.queuedUsageLink': 'Manage limit rules in Activity',
   'composer.sendNowHint': '⌘/Ctrl+Enter sends now',
   'composer.sendNowHintCmdEnter': '⌘/Ctrl+Shift+Enter sends now',
   'composer.footerSkills': ' · / for skills and commands',
@@ -2867,10 +2867,10 @@ export const en = {
   'sidebar.backgroundTasks.one': '{count} background task running',
   'sidebar.backgroundTasks.other': '{count} background tasks running',
 
-  // ---- usage dashboard (/usage) ----
-  'usage.title': 'Usage',
-  'usage.nav': 'Usage',
-  'usage.navAria': 'Open the usage dashboard',
+  // ---- activity & usage (/usage) ----
+  'usage.title': 'Activity',
+  'usage.nav': 'Activity',
+  'usage.navAria': 'Open activity and usage',
   'usage.axis.granularity': 'Granularity',
   'usage.axis.range': 'Range',
   'usage.axis.dimension': 'Breakdown',
@@ -3109,7 +3109,7 @@ export const en = {
 
   // ---- quick switcher page actions ----
   'switcher.pages': 'Pages',
-  'switcher.action.usage': 'Open usage dashboard',
+  'switcher.action.usage': 'Open activity and usage',
   'switcher.action.settings': 'Open settings',
 
   // ---- settings ----
@@ -6615,7 +6615,7 @@ export const en = {
   'nav.aria': 'Workspace tools',
   'nav.board': 'Task board',
   'nav.cron': 'Scheduled tasks',
-  'nav.usage': 'Usage',
+  'nav.usage': 'Activity',
   'nav.capabilities': 'Capabilities',
   'scope.label': 'Workspace',
   'scope.all': 'All workspaces',
@@ -10889,7 +10889,7 @@ export const en = {
   'subagent.call.expandDetails': 'Expand invocation details',
   'subagent.call.collapseDetails': 'Collapse invocation details',
   'usage.governance.realtime': 'Live',
-  'usage.governance.history': 'History',
+  'usage.governance.history': 'Usage',
   'usage.governance.stale': 'This view may be out of date · last update {time}',
   'usage.governance.requests': 'Model requests',
   'usage.governance.waiting': 'Waiting',

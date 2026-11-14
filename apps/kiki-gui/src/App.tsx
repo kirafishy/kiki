@@ -247,7 +247,7 @@ function NormalApp() {
       : location.pathname === '/discover'
         ? 'Discover'
         : location.pathname === '/usage'
-        ? 'Usage'
+          ? 'Activity'
         : location.pathname === '/cron'
             ? 'Scheduled tasks'
             : location.pathname === '/memory'

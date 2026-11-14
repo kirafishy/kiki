@@ -248,4 +248,26 @@ describe('quick switcher memory advisor command', () => {
     expect(client.patchMemoryAdvisorSettings).not.toHaveBeenCalled();
     expect(document.querySelector('[data-test-location]')?.textContent).toBe('/settings/ai?tab=defaults#st-card-decision-judges');
   });
+
+  it('finds the /usage command action by either Activity or Usage in English and 运行 or 用量 in Chinese', async () => {
+    client.searchMessages.mockResolvedValue(readyPage());
+    for (const term of ['Activity', 'Usage', '运行', '用量']) {
+      await mount();
+      const input = document.querySelector<HTMLInputElement>('input[role="combobox"]')!;
+      await act(async () => {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!.set!;
+        setter.call(input, term);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await settle();
+      const match = row('Open activity and usage');
+      expect(match).toBeDefined();
+      await act(async () => { match!.click(); });
+      expect(document.querySelector('[data-test-location]')?.textContent).toBe('/usage');
+      for (const root of roots.splice(0)) {
+        await act(async () => { root.unmount(); });
+      }
+      document.body.innerHTML = '';
+    }
+  });
 });

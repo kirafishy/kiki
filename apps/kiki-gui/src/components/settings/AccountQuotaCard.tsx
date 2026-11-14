@@ -104,7 +104,7 @@ function DetailedQuota({ method }: { method: OAuthMethodStatus }) {
       ) : null}
       <p className="text-[11px] leading-4 text-ink-faint">
         {t('st.quota.intro')}{' '}
-        <Link to="/usage" className="text-selected-ink underline-offset-2 hover:underline">{t('st.quota.usageLink')}</Link>
+        <Link to="/usage?panel=history" className="text-selected-ink underline-offset-2 hover:underline">{t('st.quota.usageLink')}</Link>
       </p>
     </section>
   );

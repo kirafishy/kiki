@@ -1525,7 +1525,7 @@ export const zh = {
   'composer.queuedWaited': '已等待：{seconds} 秒',
   'composer.queuedModel': '模型：{model}',
   'composer.queuedRules': '阻塞规则：{rules}',
-  'composer.queuedUsageLink': '在用量中管理限制规则',
+  'composer.queuedUsageLink': '在运行中管理限制规则',
   'composer.sendNowHint': '⌘/Ctrl+Enter 立即发送',
   'composer.sendNowHintCmdEnter': '⌘/Ctrl+Shift+Enter 立即发送',
   'composer.footerSkills': ' · / 调用技能与提示命令',
@@ -2837,10 +2837,10 @@ export const zh = {
   'sidebar.backgroundTasks.one': '{count} 个后台任务运行中',
   'sidebar.backgroundTasks.other': '{count} 个后台任务运行中',
 
-  // ---- usage dashboard (/usage) ----
-  'usage.title': '用量',
-  'usage.nav': '用量',
-  'usage.navAria': '打开用量仪表盘',
+  // ---- activity & usage (/usage) ----
+  'usage.title': '运行',
+  'usage.nav': '运行',
+  'usage.navAria': '打开运行与用量页面',
   'usage.axis.granularity': '粒度',
   'usage.axis.range': '范围',
   'usage.axis.dimension': '维度',
@@ -3079,7 +3079,7 @@ export const zh = {
 
   // ---- quick switcher page actions ----
   'switcher.pages': '页面',
-  'switcher.action.usage': '打开用量仪表盘',
+  'switcher.action.usage': '打开运行与用量',
   'switcher.action.settings': '打开设置',
 
   // ---- settings ----
@@ -6543,7 +6543,7 @@ export const zh = {
   'nav.aria': '工作区工具',
   'nav.board': '任务看板',
   'nav.cron': '定时任务',
-  'nav.usage': '用量',
+  'nav.usage': '运行',
   'nav.capabilities': '能力',
   'scope.label': '工作区',
   'scope.all': '全部工作区',
@@ -10797,7 +10797,7 @@ export const zh = {
   'subagent.call.expandDetails': '展开调用详情',
   'subagent.call.collapseDetails': '收起调用详情',
   'usage.governance.realtime': '实时',
-  'usage.governance.history': '历史',
+  'usage.governance.history': '用量',
   'usage.governance.stale': '数据可能已过期 · 最后更新 {time}',
   'usage.governance.requests': '模型请求',
   'usage.governance.waiting': '等待',

@@ -243,7 +243,7 @@ export function searchHasUsageParams(search: string): boolean {
 /** True when a URL carries state that belongs to the historical usage view. */
 export function searchHasUsageHistoryParams(search: string): boolean {
   const params = new URLSearchParams(search);
-  return searchHasUsageParams(search) || ['metric', 'compare', 'bucket', 'session', 'view']
+  return searchHasUsageParams(search) || ['metric', 'compare', 'bucket', 'session', 'view', 'trace']
     .some((key) => params.has(key));
 }
 

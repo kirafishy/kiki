@@ -631,19 +631,21 @@ describe('UsagePage (V2)', () => {
     await act(async () => { root.unmount(); });
   });
 
-  it('opens History when no panel is given, with Live and Quotas as the other views', async () => {
+  it('opens Live when no panel is given, with Usage and Quotas as the other views', async () => {
     const { container, root } = await renderPage('/usage');
-    expect([...container.querySelectorAll<HTMLElement>('[data-usage-panel]')].map((node) => node.dataset['usagePanel'])).toEqual(['history', 'realtime', 'quota']);
-    expect(container.querySelector('[data-usage-panel="history"]')?.getAttribute('aria-current')).toBe('page');
-    expect(container.querySelector('[data-usage-filters]')).not.toBeNull();
-    expect(mainCalls().length).toBeGreaterThan(0);
-    expect(container.querySelector('[data-request-governance]')).toBeNull();
+    expect([...container.querySelectorAll<HTMLElement>('[data-usage-panel]')].map((node) => node.dataset['usagePanel'])).toEqual(['realtime', 'history', 'quota']);
+    expect([...container.querySelectorAll<HTMLElement>('[data-usage-panel]')].map((node) => node.textContent)).toEqual(['Live', 'Usage', 'Quotas']);
+    expect(container.querySelector('header h1')?.textContent).toBe('Activity');
+    expect(container.querySelector('[data-usage-panel="realtime"]')?.getAttribute('aria-current')).toBe('page');
+    expect(container.querySelector('[data-request-governance]')).not.toBeNull();
+    expect(container.querySelector('[data-usage-filters]')).toBeNull();
+    expect(mainCalls()).toHaveLength(0);
     await act(async () => { root.unmount(); });
   });
 
   it('reaches model prices and export from the header ⋯ instead of the tab strip', async () => {
     getUsage.mockImplementation(async () => usageResponse({ unknownPriceModels: ['mystery-9'] }));
-    const { container, root } = await renderPage('/usage');
+    const { container, root } = await renderPage('/usage?panel=history');
     await act(async () => { container.querySelector<HTMLButtonElement>('header [data-usage-more]')!.click(); });
     const menu = document.querySelector('[data-usage-more-menu][role="menu"]')!;
     const items = [...menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
@@ -702,10 +704,21 @@ describe('UsagePage (V2)', () => {
     ['/usage?session=s_1', 'history'],
     ['/usage?view=sessions', 'history'],
     ['/usage?metric=tokens', 'history'],
-    ['/usage?unrelated=state', 'history'],
-    ['/usage', 'history'],
+    ['/usage?unrelated=state', 'realtime'],
+    ['/usage', 'realtime'],
   ] as const)('resolves %s to the %s panel', (search, expected) => {
     expect(usagePanelFromSearch(search.slice('/usage'.length))).toBe(expected);
+  });
+
+  it('keeps panel=history explicit when clearing a deep-linked history parameter back to default', async () => {
+    const { container, root } = await renderPage('/usage?metric=tokens');
+    expect(container.querySelector('[data-usage-panel="history"]')?.getAttribute('aria-current')).toBe('page');
+    const costButton = container.querySelector<HTMLButtonElement>('button[data-trend-metric="cost"]');
+    expect(costButton).not.toBeNull();
+    await act(async () => { costButton!.click(); });
+    expect(container.querySelector('[data-location-probe]')?.textContent).toBe('/usage?panel=history');
+    expect(container.querySelector('[data-usage-panel="history"]')?.getAttribute('aria-current')).toBe('page');
+    await act(async () => { root.unmount(); });
   });
 
   it('does not start historical queries or locator paging on an explicit realtime link', async () => {

@@ -29,12 +29,13 @@ export interface SwitcherHitItem {
   agentId?: string;
 }
 
-/** A static page destination (e.g. the usage dashboard), listed like a row. */
+/** A static page destination (e.g. Activity & usage), listed like a row. */
 export interface SwitcherActionItem {
   kind: 'action';
   actionId: string;
   title: string;
   route: string;
+  keywords?: readonly string[];
 }
 
 /** One settings card, reachable by name without opening the settings tree. */
@@ -115,7 +116,11 @@ export function buildSwitcherItems(input: {
   const ordered = sessionsByRecency(input.sessions);
   const query = input.query.trim().toLowerCase();
   const actions: SwitcherActionItem[] = (input.actions ?? [])
-    .filter((action) => query === '' || action.title.toLowerCase().includes(query))
+    .filter((action) =>
+      query === ''
+      || action.title.toLowerCase().includes(query)
+      || (action.keywords?.some((keyword) => keyword.toLowerCase().includes(query)) ?? false),
+    )
     .map((action) => ({ kind: 'action', ...action }));
   if (query === '') {
     return [

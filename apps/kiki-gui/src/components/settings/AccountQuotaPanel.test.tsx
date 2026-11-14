@@ -81,8 +81,9 @@ describe('AccountQuotaPanel', () => {
     expect(rows[1]!.textContent).toContain('per 5 h');
     expect(rows[2]!.querySelector('[role="progressbar"]')).toBeNull();
     expect(rows[2]!.textContent).toContain('3 used');
-    // It is the vendor's allowance, not this session's token use.
+    // It is the vendor's allowance, not this session's token use; the link opens Usage (history).
     expect(container.textContent).toContain('not this session’s token use');
+    expect(container.querySelector<HTMLAnchorElement>('a[href="/usage?panel=history"]')?.textContent).toBe('See session usage');
   });
 
   it('shows the vendor message when usage cannot be read, and the status quota for other accounts', async () => {

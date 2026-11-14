@@ -1,21 +1,23 @@
 import { useRef } from 'react';
 import type { I18nKey } from '@kiki/session-core/i18n';
 import { useI18n } from '../i18n';
+import { searchHasUsageHistoryParams } from '../lib/usageV2';
 
 export type UsagePanel = 'history' | 'realtime' | 'quota' | 'export';
 
 /**
- * `panel=` is the page's own axis, so a view stays deep-linkable. The page
- * answers "how much have I used" first, so a bare `/usage` visit (and any
- * link without a panel) opens History; explicit `panel=` values keep their
- * old meaning, `limits` included.
+ * `panel=` is the page's own axis, so every view stays deep-linkable: a bare
+ * `/usage` visit opens the Live governance view first, historical filter,
+ * session, or detail-view links open Usage (`history`), and explicit `panel=`
+ * values keep their meaning (`limits` included).
  */
 export function usagePanelFromSearch(search: string): UsagePanel {
   const panel = new URLSearchParams(search).get('panel');
   if (panel === 'export') return 'export';
   if (panel === 'quota') return 'quota';
+  if (panel === 'history') return 'history';
   if (panel === 'realtime' || panel === 'limits') return 'realtime';
-  return 'history';
+  return searchHasUsageHistoryParams(search) ? 'history' : 'realtime';
 }
 
 /**
@@ -24,8 +26,8 @@ export function usagePanelFromSearch(search: string): UsagePanel {
  * `panel=export` link asks for it.
  */
 const NAV_ITEMS: readonly { id: UsagePanel; labelKey: string }[] = [
-  { id: 'history', labelKey: 'usage.governance.history' },
   { id: 'realtime', labelKey: 'usage.governance.realtime' },
+  { id: 'history', labelKey: 'usage.governance.history' },
   { id: 'quota', labelKey: 'usage.quota.nav' },
 ];
 

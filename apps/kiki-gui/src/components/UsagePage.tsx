@@ -1,9 +1,9 @@
 /**
- * UsagePage (/usage) — the cross-session usage dashboard on `GET /api/usage`
- * (V2 aggregation). It opens on History, because "how much have I used" is
- * the page's question; Live and Quotas are the other views, and prices and
- * export sit behind the header's `⋯`. Reading order is one path, not a set
- * of cards:
+ * UsagePage (/usage) — the Activity & cross-session usage surface. A bare
+ * `/usage` visit opens Live (`realtime`), with Usage (`history`) and Quotas
+ * (`quota`) as sibling tabs, while model prices and export sit behind the
+ * header's `⋯`. On the Usage tab (`GET /api/usage` V2 aggregation), reading
+ * order is one path, not a set of cards:
  *
  *   - while requests run or wait, one line says so and leads to Live;
  *   - pick a range and conditions (time first, then workspace and filters);
@@ -1010,6 +1010,7 @@ export function UsagePage({ onToggleSidebar }: { onToggleSidebar: () => void }) 
   }, [traceParam]);
   const setTrace = (next: UsageSessionTraceRequest | undefined) => {
     const params = new URLSearchParams(location.search);
+    if (panel === 'history') params.set('panel', 'history');
     if (next === undefined) params.delete('trace');
     else params.set('trace', JSON.stringify(next));
     setSearchParams(params, { replace: true });
@@ -1044,6 +1045,7 @@ export function UsagePage({ onToggleSidebar }: { onToggleSidebar: () => void }) 
   const selectBucketKeyWithSnapshot = (key: string | null) => {
     setSelectedBucketKey(key);
     const params = new URLSearchParams(location.search);
+    if (panel === 'history') params.set('panel', 'history');
     params.delete('bucket');
     if (key !== null) params.set('bucket', key);
     setSearchParams(params, { replace: true });
@@ -1087,6 +1089,7 @@ export function UsagePage({ onToggleSidebar }: { onToggleSidebar: () => void }) 
 
   const applyMetric = (next: UsageMetric) => {
     const params = new URLSearchParams(location.search);
+    if (panel === 'history') params.set('panel', 'history');
     params.delete('metric');
     if (next !== 'cost') params.set('metric', next);
     setSearchParams(params, { replace: true });
@@ -1094,6 +1097,7 @@ export function UsagePage({ onToggleSidebar }: { onToggleSidebar: () => void }) 
 
   const applyCompare = (next: boolean) => {
     const params = new URLSearchParams(location.search);
+    if (panel === 'history') params.set('panel', 'history');
     params.delete('compare');
     if (next) params.set('compare', 'previous');
     setSearchParams(params, { replace: true });
@@ -1283,6 +1287,7 @@ export function UsagePage({ onToggleSidebar }: { onToggleSidebar: () => void }) 
       groupBy,
     };
     const params = new URLSearchParams(location.search);
+    params.set('panel', 'history');
     params.set('view', 'sessions');
     params.set('trace', JSON.stringify(request));
     setSearchParams(params, { replace: false });
